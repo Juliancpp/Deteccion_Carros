@@ -1,0 +1,29 @@
+# ══════════════════════════════════════════════════
+# Deteccion_Carros — Dependencias
+# ══════════════════════════════════════════════════
+# Fase 1: Detección básica de vehículos
+
+# ── Modelo de detección ──
+ultralytics>=8.3.0          # YOLO11 (incluye yolo11n)
+
+# ── Visión por computadora ──
+opencv-python>=4.9.0        # Procesamiento de video/imagen
+
+# ── Computación numérica ──
+numpy>=1.26.0               # Operaciones con arrays
+
+# ── OCR de placas ──
+easyocr>=1.7.1              # Lectura básica de placas en CPU
+
+# ── Persistencia ──
+sqlalchemy>=2.0.0           # SQLite ORM/Core para eventos
+
+# ── Dashboard web ──
+fastapi>=0.115.0            # API REST y servidor web
+uvicorn>=0.30.0             # Servidor ASGI
+
+# ── Motor de inferencia (CPU) ──
+# PyTorch CPU-only (sin CUDA) — más liviano
+--extra-index-url https://download.pytorch.org/whl/cpu
+torch>=2.1.0
+torchvision>=0.16.0
