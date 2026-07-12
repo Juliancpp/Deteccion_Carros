@@ -1,6 +1,9 @@
 # Entorno virtual
 venv/
 
+# Configuracion local sensible
+.env
+
 # Python
 __pycache__/
 *.pyc
@@ -8,15 +11,30 @@ __pycache__/
 *.egg-info/
 
 # Modelos descargados (pesados)
+/yolo11n.pt
 models/*.pt
 models/*.onnx
 
 # Capturas (generadas en runtime)
 data/captures/*.jpg
 data/captures/*.png
+data/rtsp_test/*.jpg
+data/multicamera_test/*.jpg
+data/line_calibration/*.jpg
+data/passage_calibration/*.jpg
+data/multicamera_events_test/*.jpg
+data/hotel_events/
+data/hotel_calibration/*.jpg
+data/hotel_phase1_calibration/*.jpg
+data/hotel_phase1_test/*.jpg
+data/reportes/*.xlsx
+*.mkv
 
 # Base de datos
 database/*.db
+
+# Logs
+*.log
 
 # IDE
 .vscode/

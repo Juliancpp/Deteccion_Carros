@@ -7,6 +7,11 @@ exponiendo las detecciones en una estructura limpia y estandarizada.
 
 from typing import Dict, List, Any
 
+try:
+    from app.tracking.bytetrack_adapter import ByteTrackAdapter
+except ImportError:
+    from tracking.bytetrack_adapter import ByteTrackAdapter  # type: ignore
+
 
 class VehicleTracker:
     """
@@ -14,15 +19,32 @@ class VehicleTracker:
     el estado de los vehículos que están activos en pantalla.
     """
 
-    def __init__(self):
+    def __init__(self, camera_id: str = "local", allow_iou_fallback: bool = False):
         # Almacena el historial de vehículos activos en el frame actual
+        self.camera_id = camera_id
         self.active_vehicles: Dict[int, Dict[str, Any]] = {}
+        self._adapter = ByteTrackAdapter(camera_id=camera_id, allow_iou_fallback=allow_iou_fallback)
+
+    @property
+    def tracker_backend(self) -> str:
+        return self._adapter.tracker_backend
+
+    def ensure_ready(self) -> None:
+        self._adapter.ensure_ready()
 
     def reset(self) -> None:
         """Limpia el estado de IDs activos mantenido por el tracker local."""
         self.active_vehicles.clear()
+        self._adapter.reset()
 
-    def update(self, results) -> List[Dict[str, Any]]:
+    def update(
+        self,
+        results=None,
+        detections: List[Dict[str, Any]] | None = None,
+        frame_shape=None,
+        timestamp=None,
+        frame=None,
+    ) -> List[Dict[str, Any]]:
         """
         Procesa el output de model.track() de YOLO y actualiza
         los vehículos activos.
@@ -42,6 +64,16 @@ class VehicleTracker:
                 ...
             ]
         """
+        if detections is not None:
+            tracked = self._adapter.update(
+                detections,
+                frame_shape=frame_shape,
+                timestamp=timestamp,
+                frame=frame,
+            )
+            self.active_vehicles = dict(self._adapter.active_vehicles)
+            return tracked
+
         current_frame_vehicles = []
         self.active_vehicles.clear()  # Limpiar para este frame
 
@@ -59,7 +91,10 @@ class VehicleTracker:
                 confidence = float(boxes.conf[i].cpu().numpy())
                 
                 # Importar nombres de clase de config para homogeneizar
-                from config import CLASS_NAMES
+                try:
+                    from app.config import CLASS_NAMES
+                except ImportError:
+                    from config import CLASS_NAMES  # type: ignore
                 class_name = CLASS_NAMES.get(class_id, "Desconocido")
 
                 # Obtener ID asignado por el Tracker.

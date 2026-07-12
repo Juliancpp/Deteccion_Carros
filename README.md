@@ -36,12 +36,20 @@ Deteccion_Carros/
 │   ├── evidence.py       ← (Fase 4) Captura de evidencia
 │   ├── ocr.py            ← (Fase 5) Lectura básica de placas
 │   ├── database.py       ← (Fase 6) Persistencia SQLite
-│   └── api.py            ← (Fase 7) Dashboard web/API REST
+│   ├── api.py            ← (Fase 7) Dashboard web/API REST
+│   ├── settings.py       ← (Fase 8A) Configuración segura DVR/RTSP
+│   ├── multicamera/      ← (Fase 9A) Coordinador multicámara
+│   └── video/
+│       └── rtsp_stream.py ← (Fase 8B) Captura RTSP robusta
 ├── models/               ← Modelos YOLO
 ├── data/
 │   ├── videos/           ← Videos de prueba
 │   └── captures/         ← Capturas de evidencia
 ├── database/             ← Archivos SQLite
+├── scripts/
+│   ├── validate_camera_config.py
+│   ├── test_rtsp_streams.py
+│   └── test_multicamera_inference.py
 ├── web/
 │   ├── index.html        ← Dashboard
 │   ├── style.css         ← Estilos
@@ -80,6 +88,12 @@ venv\Scripts\activate
 
 ```bash
 pip install -r requirements.txt
+```
+
+Para ejecutar pruebas automatizadas:
+
+```bash
+pip install -r requirements-dev.txt
 ```
 
 > ⏳ La primera instalación descarga PyTorch y EasyOCR/modelos asociados. Puede tomar varios minutos.
@@ -131,11 +145,15 @@ python app/main.py --video data/videos/mi_video.mp4
 python app/main.py --video 0
 ```
 
-### Usando un stream RTSP
+### Usando un stream RTSP manual
 
 ```bash
-python app/main.py --video "rtsp://usuario:clave@192.168.1.100:554/stream"
+python app/main.py --video "<URL_RTSP_LOCAL>"
 ```
+
+Evita compartir logs si contienen URLs RTSP completas con credenciales. La Fase
+8A prepara configuracion segura, pero aun no conecta las camaras DVR al pipeline
+principal.
 
 ### Dashboard web
 
@@ -183,6 +201,218 @@ Edita `app/config.py` para ajustar:
 | `OCR_LANGUAGES` | Idiomas EasyOCR | `["en"]` |
 | `OCR_MIN_CONFIDENCE` | Confianza mínima para aceptar OCR | `0.40` |
 | `DATABASE_PATH` | Archivo SQLite de eventos | `database/eventos.db` |
+| `RTSP_TRANSPORT` | Transporte RTSP usado por OpenCV/FFmpeg | `"tcp"` |
+| `RTSP_OPEN_TIMEOUT_MS` | Timeout de apertura RTSP | `5000` |
+| `RTSP_READ_TIMEOUT_MS` | Timeout de lectura RTSP | `5000` |
+| `RTSP_STALE_TIMEOUT_SECONDS` | Segundos sin frames antes de reconectar | `10` |
+| `RTSP_RECONNECT_INITIAL_SECONDS` | Backoff inicial de reconexión | `1` |
+| `RTSP_RECONNECT_MAX_SECONDS` | Backoff máximo de reconexión | `15` |
+| `RTSP_MAX_CONSECUTIVE_READ_FAILURES` | Fallos consecutivos antes de reconectar | `3` |
+| `MULTICAMERA_ENABLED` | Habilita componentes multicámara | `True` |
+| `INFERENCE_SCHEDULER_IDLE_SLEEP_SECONDS` | Pausa mínima del scheduler | `0.002` |
+| `INFERENCE_RESULT_COPY_FRAME` | Copia frame anotado al publicar resultado | `True` |
+| `INFERENCE_STATUS_WINDOW_SECONDS` | Ventana de métricas FPS | `5` |
+
+### Configuracion segura DVR/RTSP — Fase 8A
+
+Las credenciales del DVR no se guardan en Python ni deben subirse a Git. Crea
+tu archivo local desde la plantilla:
+
+```bash
+cp .env.example .env
+chmod 600 .env
+nano .env
+```
+
+Si antes exportaste credenciales en la terminal, limpialas:
+
+```bash
+unset DVR_HOST
+unset DVR_RTSP_PORT
+unset DVR_USERNAME
+unset DVR_PASSWORD
+unset DVR_PASS
+```
+
+Valida la configuracion sin conectar al DVR:
+
+```bash
+python scripts/validate_camera_config.py
+```
+
+Los scripts locales cargan `.env` con prioridad sobre variables exportadas para
+evitar usar credenciales antiguas de la terminal.
+
+El script muestra host, puerto, camaras habilitadas y URLs sanitizadas. La URL
+interna se construye con usuario y password escapados correctamente, pero en
+logs debe verse como:
+
+```text
+rtsp://detector:***@192.168.0.100:554/Streaming/Channels/101
+```
+
+Advertencias de seguridad:
+- No subas `.env`.
+- No copies contraseñas en capturas de pantalla.
+- No ejecutes FFmpeg con URLs que contengan credenciales directamente si vas a compartir logs.
+- Cambia inmediatamente cualquier contraseña que haya sido expuesta.
+
+### Captura RTSP robusta — Fase 8B
+
+`RTSPStream` implementa una capa independiente del pipeline de IA:
+
+```text
+DVR RTSP -> hilo por camara -> buffer de 1 frame -> consumidor lee el ultimo frame
+```
+
+El buffer conserva exactamente el frame mas reciente; un frame nuevo reemplaza
+al anterior y no se forma una cola. La captura usa OpenCV con backend FFmpeg
+cuando esta disponible, transporte RTSP por TCP y reconexion automatica con
+backoff `1s, 2s, 4s, 8s, 15s max`.
+
+El estado consultable incluye:
+- `connected`, `frame_sequence`, `last_frame_at`, `frame_age_seconds`.
+- `capture_fps` medido por la aplicacion y `source_fps` reportado por el stream.
+- `connection_attempts`, `reconnect_count`, `read_error_count`.
+- `last_error` sanitizado, sin URL completa ni contraseña.
+
+El script de prueba no ejecuta YOLO, ByteTrack, OCR, SQLite ni dashboard. Solo
+valida recepcion de frames y puede guardar snapshots JPG del ultimo frame.
+
+Prueba A1:
+
+```bash
+source venv/bin/activate
+python scripts/diagnose_rtsp_auth.py --camera A1
+python scripts/test_rtsp_streams.py --camera A1 --duration 20 --save-snapshots
+```
+
+Prueba A5:
+
+```bash
+python scripts/diagnose_rtsp_auth.py --camera A5
+python scripts/test_rtsp_streams.py --camera A5 --duration 20 --save-snapshots
+```
+
+Prueba simultanea:
+
+```bash
+python scripts/diagnose_rtsp_auth.py --camera all
+python scripts/test_rtsp_streams.py --camera all --duration 30 --save-snapshots
+```
+
+Las salidas muestran resumen seguro por camara, por ejemplo:
+
+```text
+A1 connected=true frames=124 capture_fps=24.8 age=0.03s reconnects=0 errors=0
+```
+
+No se imprimen URLs RTSP completas ni contraseñas.
+
+### Multicámara + YOLO compartido + tracking aislado — Fase 9A
+
+La Fase 9A agrega un coordinador multicámara sin integrar todavía línea virtual,
+OCR, SQLite ni dashboard. La arquitectura es:
+
+```text
+A1 RTSP latest-frame ┐
+                     ├-> scheduler round-robin -> una instancia YOLO -> tracker A1
+A5 RTSP latest-frame ┘                                      └-> tracker A5
+```
+
+Puntos clave:
+- YOLO11n se carga una sola vez por coordinador.
+- Validado en CPU con `./venv/bin/python`, Torch CPU y `torch.cuda.is_available() == False`.
+- En prueba real simultánea A1+A5 se observó `model_loads=1` y backend `ultralytics-bytetrack`.
+- La prueba de 300 segundos fue estable, con cierre limpio y sin segmentation fault.
+- Rendimiento real observado: ~6.6 inferencias totales/s, CPU ~168–171% y RAM máxima ~515–520 MB.
+- El modelo se invoca desde un único hilo de inferencia; no hay inferencia concurrente.
+- Cada cámara tiene su propio tracker y sus IDs no se mezclan.
+- El scheduler toma siempre el frame más reciente; no crea backlog.
+- `CAMERA_A1_TARGET_FPS` y `CAMERA_A5_TARGET_FPS` vienen de `.env`.
+- El FPS real puede ser menor al objetivo si el CPU no alcanza; se reporta como métrica.
+
+Prueba real multicámara:
+
+```bash
+python scripts/test_multicamera_inference.py --duration 30 --save-snapshots
+```
+
+Prueba prolongada:
+
+```bash
+python scripts/test_multicamera_inference.py --duration 300
+```
+
+Los snapshots anotados se guardan en:
+
+```text
+data/multicamera_test/
+```
+
+### Corredores virtuales y eventos multicámara — Fase 9B
+
+La Fase 9B agrega un corredor direccional independiente por cámara sobre el
+coordinador multicámara. Todavía no ejecuta OCR, SQLite, dashboard ni evidencia
+productiva.
+
+Puntos clave:
+- Los corredores se configuran como polilíneas normalizadas `0.0..1.0` por cámara.
+- A1 usa un corredor de ingreso y genera `ENTRADA` temprano para no perder vehículos que se desvíen al primer portón.
+- A5 usa un corredor de salida y genera `SALIDA` al recorrer la curva hacia el exterior.
+- Cada `CameraContext` mantiene su propio `PassageCorridorDetector`; un ID repetido en A1 y A5 no comparte estado.
+- El punto de seguimiento configurable usa `bottom_center`, el punto inferior central del bbox.
+- La confirmación exige observaciones mínimas, avance longitudinal, dirección consistente y distancia lateral dentro del corredor.
+- El scheduler genera `EventCandidate` y lo publica en una cola acotada.
+- Si la cola se llena, el scheduler no bloquea: incrementa métrica y descarta el evento nuevo.
+- La deduplicación usa estado por track, TTL y cooldown por `(camera_id, track_id, direction)`.
+- Al reconectar una cámara se reinicia solo su tracker y su detector de corredor.
+
+Variables de corredor en `.env`:
+
+```env
+CAMERA_A1_PASSAGE_ENABLED=true
+CAMERA_A1_PASSAGE_EVENT=ENTRADA
+CAMERA_A1_PASSAGE_DIRECTION=forward
+CAMERA_A1_TRIGGER_PROGRESS=0.15
+CAMERA_A1_CORRIDOR_POINTS=0.27,0.98;0.43,0.83;0.59,0.69;0.70,0.58
+CAMERA_A1_CORRIDOR_HALF_WIDTH=0.08
+```
+
+Calibración sin GUI, guardando snapshots con el corredor actual:
+
+```bash
+./venv/bin/python scripts/calibrate_passage_corridors.py --camera all
+```
+
+Calibración interactiva opcional:
+
+```bash
+./venv/bin/python scripts/calibrate_passage_corridors.py --camera A1 --interactive
+./venv/bin/python scripts/calibrate_passage_corridors.py --camera A5 --interactive
+```
+
+Validación de eventos:
+
+```bash
+./venv/bin/python scripts/test_multicamera_events.py --camera all --duration 120 --save-event-snapshots
+```
+
+Los snapshots de calibración se guardan en `data/passage_calibration/` y los
+snapshots de eventos de prueba en `data/multicamera_events_test/`. La validación
+operativa completa requiere un paso vehicular real; si no cruza un vehículo, el
+script solo valida captura, inferencia, tracking, corredor, cola y cierre.
+
+#### Nota OpenCV / EasyOCR
+
+En esta fase se valida con una sola variante instalada de OpenCV. Evita mezclar
+`opencv-python` y `opencv-python-headless` en el mismo entorno porque ambos
+paquetes instalan el modulo nativo `cv2` y pueden provocar cierres inestables.
+
+Estrategias recomendadas para una fase posterior:
+- Usar entornos separados: produccion headless para servicio y desarrollo GUI para pruebas locales.
+- Instalar EasyOCR sin dependencias y declarar manualmente sus dependencias compatibles.
+- Migrar el modo local para no depender de `cv2.imshow` y usar solo `opencv-python-headless`.
 
 ### Línea virtual y eventos — Fase 3
 
@@ -302,6 +532,10 @@ CONFIDENCE_THRESHOLD = 0.45  # Subir umbral para menos detecciones
 | **5** | Reconocimiento de placas (OCR) | ✅ Completada |
 | **6** | Base de datos SQLite | ✅ Completada |
 | **7** | Dashboard web | ✅ Completada |
+| **8A** | Configuración segura DVR/RTSP | ✅ Completada |
+| **8B** | Capturador RTSP robusto | ✅ Completada |
+| **9A** | Multicámara + YOLO compartido + tracking aislado | ✅ Completada |
+| **9B** | Corredores virtuales y eventos multicámara | En validación |
 
 ---
 

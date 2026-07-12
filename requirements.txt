@@ -17,10 +17,14 @@ easyocr>=1.7.1              # Lectura básica de placas en CPU
 
 # ── Persistencia ──
 sqlalchemy>=2.0.0           # SQLite ORM/Core para eventos
+openpyxl>=3.1.5             # Exportacion Excel del MVP hotel
 
 # ── Dashboard web ──
 fastapi>=0.115.0            # API REST y servidor web
 uvicorn>=0.30.0             # Servidor ASGI
+
+# ── Configuracion segura ──
+python-dotenv>=1.0.0        # Carga local de .env sin versionar
 
 # ── Motor de inferencia (CPU) ──
 # PyTorch CPU-only (sin CUDA) — más liviano

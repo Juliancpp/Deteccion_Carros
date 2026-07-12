@@ -1,0 +1,37 @@
+# Entorno CPU validado para Python 3.12.
+#
+# Instalacion recomendada en dos pasos:
+#   python -m pip install --index-url https://download.pytorch.org/whl/cpu \
+#     torch==2.13.0+cpu torchvision==0.28.0+cpu
+#   python -m pip install --no-deps easyocr==1.7.2
+#   python -m pip install -r requirements-cpu.txt
+#
+# No instalar opencv-python-headless junto a opencv-python.
+# No instalar builds CUDA/ROCm de Torch para este proyecto.
+
+--extra-index-url https://download.pytorch.org/whl/cpu
+
+torch==2.13.0+cpu
+torchvision==0.28.0+cpu
+ultralytics==8.4.92
+ultralytics-thop==2.0.20
+opencv-python==5.0.0.93
+numpy==2.5.1
+easyocr==1.7.2
+lap==0.5.13
+python-dotenv>=1.0.0
+
+# Dependencias usadas por las fases actuales.
+fastapi
+uvicorn
+matplotlib
+pillow
+psutil
+pyyaml
+requests
+scipy
+scikit-image
+shapely
+pyclipper
+python-bidi
+ninja

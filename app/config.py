@@ -27,6 +27,7 @@ CAMERAS = [
 VIDEO_PATH = CAMERAS[0]["source"]
 CAMERA_ID = CAMERAS[0]["id"]
 DATABASE_PATH = os.path.join(BASE_DIR, "database", "eventos.db")
+HOTEL_DATABASE_PATH = os.path.join(BASE_DIR, "database", "hotel_mvp.db")
 
 # ─── Umbral de confianza ─────────────────────────────────────
 # Detecciones por debajo de este valor serán ignoradas.
@@ -94,3 +95,58 @@ FRAME_SKIP = 1
 # Tamaño de inferencia YOLO (menor = más rápido, menos preciso).
 # Valores recomendados: 320, 416, 480, 640
 INFERENCE_SIZE = 480
+
+# ─── RTSP robusto (Fase 8B) ──────────────────────────────────
+# No contiene credenciales. Las URLs se construyen desde app/settings.py.
+RTSP_TRANSPORT = "tcp"
+RTSP_OPEN_TIMEOUT_MS = 5000
+RTSP_READ_TIMEOUT_MS = 5000
+RTSP_STALE_TIMEOUT_SECONDS = 10
+RTSP_RECONNECT_INITIAL_SECONDS = 1
+RTSP_RECONNECT_MAX_SECONDS = 15
+RTSP_MAX_CONSECUTIVE_READ_FAILURES = 3
+RTSP_STOP_JOIN_TIMEOUT_SECONDS = 8
+
+# ─── Multicámara + inferencia compartida (Fase 9A) ───────────
+MULTICAMERA_ENABLED = True
+INFERENCE_SCHEDULER_IDLE_SLEEP_SECONDS = 0.002
+INFERENCE_RESULT_COPY_FRAME = True
+INFERENCE_STATUS_WINDOW_SECONDS = 5
+
+# ─── Eventos multicámara por línea virtual (Fase 9B) ─────────
+EVENT_QUEUE_MAXSIZE = 64
+EVENT_TRACK_TTL_SECONDS = 10
+EVENT_DUPLICATE_COOLDOWN_SECONDS = 5
+EVENT_FRAME_COPY_ENABLED = True
+
+# ─── Corredores virtuales direccionales (Fase 9B) ────────────
+PASSAGE_TRACK_POINT = "bottom_center"
+PASSAGE_MIN_OBSERVATIONS = 3
+PASSAGE_MIN_PROGRESS_DELTA = 0.08
+PASSAGE_MAX_LATERAL_DISTANCE_NORMALIZED = 0.08
+PASSAGE_TRACK_TTL_SECONDS = 10
+PASSAGE_DUPLICATE_COOLDOWN_SECONDS = 10
+
+# ─── MVP hotel ───────────────────────────────────────────────
+HOTEL_EVIDENCE_DIR = os.path.join(BASE_DIR, "data", "hotel_events")
+HOTEL_REPORT_PATH = os.path.join(BASE_DIR, "data", "reportes", "control_vehiculos.xlsx")
+HOTEL_FRAME_BUFFER_MAX_CANDIDATES = 6
+HOTEL_FRAME_BUFFER_TTL_SECONDS = 20
+HOTEL_OCR_QUEUE_MAXSIZE = 32
+HOTEL_EVENT_QUEUE_MAXSIZE = 64
+HOTEL_GATE_MIN_OBSERVATIONS = 3
+HOTEL_GATE_MIN_DELTA = 0.06
+HOTEL_GATE_DUPLICATE_COOLDOWN_SECONDS = 10
+HOTEL_ROOM_MIN_PROBABLE_OBSERVATIONS = 2
+HOTEL_ROOM_MIN_CONFIRMED_OBSERVATIONS = 4
+HOTEL_PLATE_MIN_CONFIDENCE = 0.55
+
+# ─── MVP hotel fase 1: dirección física + habitación ─────────
+DIRECTION_MIN_OBSERVATIONS = 3
+DIRECTION_MIN_PROGRESS_DELTA = 0.06
+DIRECTION_TRACK_TTL_SECONDS = 8
+DIRECTION_HISTORY_SIZE = 8
+ROOM_TRACK_MISSING_GRACE_SECONDS = 1.5
+ROOM_TRACK_TTL_SECONDS = 10
+ROOM_MIN_PROBABLE_OBSERVATIONS = 2
+ROOM_MIN_CONFIRMED_OBSERVATIONS = 4

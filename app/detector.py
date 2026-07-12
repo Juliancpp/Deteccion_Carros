@@ -12,16 +12,29 @@ from typing import List, Tuple
 
 import cv2
 import numpy as np
-from ultralytics import YOLO
+try:
+    from ultralytics import YOLO
+except ImportError:
+    YOLO = None
 
-from config import (
-    MODEL_PATH,
-    CONFIDENCE_THRESHOLD,
-    CLASSES_ALLOWED,
-    CLASS_NAMES,
-    CLASS_COLORS,
-    INFERENCE_SIZE,
-)
+try:
+    from app.config import (
+        MODEL_PATH,
+        CONFIDENCE_THRESHOLD,
+        CLASSES_ALLOWED,
+        CLASS_NAMES,
+        CLASS_COLORS,
+        INFERENCE_SIZE,
+    )
+except ImportError:
+    from config import (  # type: ignore
+        MODEL_PATH,
+        CONFIDENCE_THRESHOLD,
+        CLASSES_ALLOWED,
+        CLASS_NAMES,
+        CLASS_COLORS,
+        INFERENCE_SIZE,
+    )
 
 
 @dataclass
@@ -47,6 +60,8 @@ class VehicleDetector:
         detections = detector.detect(frame)
     """
 
+    model_load_count = 0
+
     def __init__(self):
         """Inicializa el detector cargando el modelo YOLO."""
         self._load_model()
@@ -58,6 +73,9 @@ class VehicleDetector:
         Si no existe localmente, Ultralytics lo descarga automáticamente.
         """
         # Asegurar que el directorio models/ existe
+        if YOLO is None:
+            raise RuntimeError("ultralytics no esta instalado; instala requirements.txt para usar YOLO")
+
         models_dir = os.path.dirname(MODEL_PATH)
         os.makedirs(models_dir, exist_ok=True)
 
@@ -71,6 +89,7 @@ class VehicleDetector:
             print(f"[↓] Descargando yolo11n.pt automáticamente...")
 
         self.model = YOLO(model_source)
+        VehicleDetector.model_load_count += 1
 
         # Forzar uso de CPU
         self.model.to("cpu")
@@ -321,3 +340,6 @@ class VehicleDetector:
         """Tiempo de la última inferencia en milisegundos."""
         return self._inference_time
 
+    @classmethod
+    def get_model_load_count(cls) -> int:
+        return cls.model_load_count

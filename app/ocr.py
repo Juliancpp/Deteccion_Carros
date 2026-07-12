@@ -10,7 +10,10 @@ from typing import Optional
 import cv2
 import numpy as np
 
-from config import OCR_ENABLED, OCR_LANGUAGES, OCR_MIN_CONFIDENCE
+try:
+    from app.config import OCR_ENABLED, OCR_LANGUAGES, OCR_MIN_CONFIDENCE
+except ImportError:
+    from config import OCR_ENABLED, OCR_LANGUAGES, OCR_MIN_CONFIDENCE  # type: ignore
 
 
 class PlateReader:
