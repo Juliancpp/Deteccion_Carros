@@ -27,6 +27,8 @@ class CameraClipBuffer:
         Adds a frame copy to the circular queue if rate limiting permits.
         Rate-limited to 5 FPS (i.e. at least 1/5 seconds = 0.2s interval).
         """
+        if frame is None or not isinstance(frame, np.ndarray) or frame.size == 0 or len(frame.shape) < 2:
+            return False
         now = time.monotonic()
         interval = 1.0 / self.sample_fps
         

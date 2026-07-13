@@ -1,0 +1,73 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Hotel Relax - Inicio de sesión</title>
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body class="login-body">
+  <main class="login-shell">
+    <section class="login-card" aria-labelledby="loginTitle">
+      <div class="login-mark" aria-hidden="true">HR</div>
+      <p class="login-kicker">Hotel Relax · Latacunga</p>
+      <h1 id="loginTitle">Panel de Control Vehicular</h1>
+      <p class="login-subtitle">Acceso exclusivo para personal autorizado</p>
+      <form id="loginForm" class="login-form">
+        <div class="login-field">
+          <label for="loginUsername">Usuario</label>
+          <input id="loginUsername" name="username" type="text" autocomplete="username" required autofocus>
+        </div>
+        <div class="login-field">
+          <label for="loginPassword">Contraseña</label>
+          <div class="password-row">
+            <input id="loginPassword" name="password" type="password" autocomplete="current-password" required>
+            <button id="togglePassword" type="button" aria-label="Mostrar u ocultar contraseña">Mostrar</button>
+          </div>
+        </div>
+        <div id="loginError" class="login-error" role="status" aria-live="polite"></div>
+        <button id="loginSubmit" class="login-submit" type="submit">
+          <span class="login-submit-text">Iniciar sesión</span>
+          <span class="login-spinner" aria-hidden="true"></span>
+        </button>
+      </form>
+      <p class="secure-note">Conexión de sesión protegida</p>
+    </section>
+  </main>
+  <script>
+    const form = document.getElementById("loginForm");
+    const submit = document.getElementById("loginSubmit");
+    const errorBox = document.getElementById("loginError");
+    const password = document.getElementById("loginPassword");
+    document.getElementById("togglePassword").addEventListener("click", () => {
+      password.type = password.type === "password" ? "text" : "password";
+    });
+    form.addEventListener("submit", async (event) => {
+      event.preventDefault();
+      submit.classList.add("loading");
+      submit.disabled = true;
+      errorBox.textContent = "";
+      try {
+        const res = await fetch("/api/auth/login", {
+          method: "POST",
+          credentials: "same-origin",
+          headers: {"Content-Type": "application/json"},
+          body: JSON.stringify({
+            username: document.getElementById("loginUsername").value,
+            password: password.value
+          })
+        });
+        const data = await res.json().catch(() => ({}));
+        if (!res.ok) throw new Error(data.detail || "No se pudo iniciar sesión.");
+        sessionStorage.setItem("csrfToken", data.csrf_token || "");
+        window.location.href = "/";
+      } catch (err) {
+        errorBox.textContent = err.message;
+      } finally {
+        submit.classList.remove("loading");
+        submit.disabled = false;
+      }
+    });
+  </script>
+</body>
+</html>

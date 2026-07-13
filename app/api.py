@@ -8,12 +8,16 @@ import os
 import sys
 import hmac
 import json
+import base64
+import hashlib
+import secrets
+import time
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
-from fastapi import FastAPI, Depends, HTTPException, status, Query
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi import FastAPI, Depends, HTTPException, Request, Response, status
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
 
@@ -26,18 +30,109 @@ import app.config as config
 from app.database import DatabaseManager
 from app.hotel.store import HotelStore
 from app.export.excel_exporter import HotelExcelExporter
+from app.runtime import is_valid_jpeg, runtime_snapshot_path, snapshot_info, validate_runtime_camera
 
 app = FastAPI(title="Deteccion_Carros Dashboard", version="1.0.0")
 
 # Security schema for optional Basic Auth
-security = HTTPBasic()
+security = HTTPBasic(auto_error=False)
+SESSION_COOKIE = "hotel_relax_session"
+CSRF_COOKIE = "hotel_relax_csrf"
+_login_failures: dict[str, tuple[int, float]] = {}
 
 
-def check_auth(credentials: HTTPBasicCredentials = Depends(security)) -> bool:
-    """Verifies credentials if DASHBOARD_AUTH_ENABLED is set to true."""
-    auth_enabled = os.getenv("DASHBOARD_AUTH_ENABLED", "false").lower() == "true"
-    if not auth_enabled:
+def _auth_enabled() -> bool:
+    return os.getenv("DASHBOARD_AUTH_ENABLED", "false").lower() == "true"
+
+
+def _session_secret() -> str:
+    return os.getenv("DASHBOARD_SESSION_SECRET") or os.getenv("DASHBOARD_PASSWORD", "valor_local")
+
+
+def _sign_session(username: str, expires_at: int) -> str:
+    payload = json.dumps({"u": username, "exp": expires_at}, separators=(",", ":")).encode("utf-8")
+    body = base64.urlsafe_b64encode(payload).decode("ascii")
+    sig = hmac.new(_session_secret().encode("utf-8"), body.encode("ascii"), hashlib.sha256).hexdigest()
+    return f"{body}.{sig}"
+
+
+def _verify_session(token: str | None) -> str | None:
+    if not token or "." not in token:
+        return None
+    body, sig = token.rsplit(".", 1)
+    expected = hmac.new(_session_secret().encode("utf-8"), body.encode("ascii"), hashlib.sha256).hexdigest()
+    if not hmac.compare_digest(sig, expected):
+        return None
+    try:
+        payload = json.loads(base64.urlsafe_b64decode(body.encode("ascii")))
+    except Exception:
+        return None
+    if int(payload.get("exp", 0)) < int(time.time()):
+        return None
+    return str(payload.get("u") or "")
+
+
+def _cookie_secure(request: Request | None = None) -> bool:
+    mode = os.getenv("DASHBOARD_COOKIE_SECURE", "auto").lower()
+    if mode == "true":
         return True
+    if mode == "false":
+        return False
+    forwarded_proto = request.headers.get("X-Forwarded-Proto", "") if request else ""
+    return forwarded_proto.lower() == "https"
+
+
+def _set_session_cookie(response: Response, username: str, request: Request | None = None) -> str:
+    hours = float(os.getenv("DASHBOARD_SESSION_HOURS", "8"))
+    max_age = int(hours * 3600)
+    token = _sign_session(username, int(time.time()) + max_age)
+    csrf = secrets.token_urlsafe(24)
+    response.set_cookie(
+        SESSION_COOKIE,
+        token,
+        max_age=max_age,
+        httponly=True,
+        secure=_cookie_secure(request),
+        samesite="lax",
+        path="/",
+    )
+    response.set_cookie(
+        CSRF_COOKIE,
+        csrf,
+        max_age=max_age,
+        httponly=False,
+        secure=_cookie_secure(request),
+        samesite="lax",
+        path="/",
+    )
+    return csrf
+
+
+def _clear_session_cookie(response: Response) -> None:
+    response.delete_cookie(SESSION_COOKIE, path="/")
+    response.delete_cookie(CSRF_COOKIE, path="/")
+
+
+def _client_key(request: Request) -> str:
+    return request.client.host if request.client else "local"
+
+
+def check_auth(request: Request, credentials: HTTPBasicCredentials | None = Depends(security)) -> bool:
+    """Verifies credentials if DASHBOARD_AUTH_ENABLED is set to true."""
+    if not _auth_enabled():
+        return True
+
+    username = _verify_session(request.cookies.get(SESSION_COOKIE))
+    if username:
+        if request.method in {"POST", "PATCH", "DELETE"}:
+            csrf_cookie = request.cookies.get(CSRF_COOKIE)
+            csrf_header = request.headers.get("X-CSRF-Token")
+            if not csrf_cookie or not csrf_header or not hmac.compare_digest(csrf_cookie, csrf_header):
+                raise HTTPException(status_code=403, detail="CSRF token inválido.")
+        return True
+
+    if credentials is None:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Sesión requerida.")
 
     expected_username = os.getenv("DASHBOARD_USERNAME", "admin")
     expected_password = os.getenv("DASHBOARD_PASSWORD", "valor_local")
@@ -48,7 +143,7 @@ def check_auth(credentials: HTTPBasicCredentials = Depends(security)) -> bool:
     if not (is_username_correct and is_password_correct):
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Incorrect username or password",
+            detail="Credenciales incorrectas.",
             headers={"WWW-Authenticate": "Basic"},
         )
     return True
@@ -63,9 +158,78 @@ app.mount("/static", StaticFiles(directory=str(WEB_DIR)), name="static")
 
 
 @app.get("/")
-def dashboard(authenticated: bool = Depends(check_auth)):
+def dashboard(request: Request, authenticated: bool = Depends(check_auth)):
     """Sirve el dashboard web."""
     return FileResponse(WEB_DIR / "index.html")
+
+
+@app.get("/login", response_class=HTMLResponse)
+def login_page():
+    return FileResponse(WEB_DIR / "login.html")
+
+
+@app.post("/api/auth/login")
+async def login(request: Request, response: Response):
+    if not _auth_enabled():
+        csrf = _set_session_cookie(response, os.getenv("DASHBOARD_USERNAME", "admin"), request)
+        return {"ok": True, "username": os.getenv("DASHBOARD_USERNAME", "admin"), "csrf_token": csrf}
+    key = _client_key(request)
+    attempts, locked_until = _login_failures.get(key, (0, 0.0))
+    now = time.time()
+    if locked_until > now:
+        return JSONResponse(status_code=429, content={"detail": "Bloqueo temporal activo.", "retry_after_seconds": int(locked_until - now)})
+    try:
+        data = await request.json()
+    except Exception:
+        return JSONResponse(status_code=400, content={"detail": "JSON inválido."})
+    username = str(data.get("username", ""))
+    password = str(data.get("password", ""))
+    expected_username = os.getenv("DASHBOARD_USERNAME", "admin")
+    expected_password = os.getenv("DASHBOARD_PASSWORD", "valor_local")
+    ok = hmac.compare_digest(username.encode("utf-8"), expected_username.encode("utf-8")) and hmac.compare_digest(
+        password.encode("utf-8"), expected_password.encode("utf-8")
+    )
+    if not ok:
+        max_attempts = int(os.getenv("DASHBOARD_LOGIN_MAX_ATTEMPTS", "5"))
+        lock_seconds = int(os.getenv("DASHBOARD_LOGIN_LOCK_SECONDS", "300"))
+        attempts += 1
+        _login_failures[key] = (attempts, now + lock_seconds if attempts >= max_attempts else 0.0)
+        return JSONResponse(status_code=401, content={"detail": "Credenciales incorrectas."})
+    _login_failures.pop(key, None)
+    csrf = _set_session_cookie(response, username, request)
+    return {"ok": True, "username": username, "csrf_token": csrf}
+
+
+@app.post("/api/auth/logout")
+def logout(response: Response, authenticated: bool = Depends(check_auth)):
+    _clear_session_cookie(response)
+    return {"ok": True}
+
+
+@app.get("/api/auth/me")
+def auth_me(request: Request):
+    if not _auth_enabled():
+        return {"authenticated": True, "username": os.getenv("DASHBOARD_USERNAME", "admin"), "csrf_token": request.cookies.get(CSRF_COOKIE)}
+    username = _verify_session(request.cookies.get(SESSION_COOKIE))
+    if not username:
+        return JSONResponse(status_code=401, content={"authenticated": False})
+    return {"authenticated": True, "username": username, "csrf_token": request.cookies.get(CSRF_COOKIE)}
+
+
+@app.get("/api/health")
+def health():
+    status_path = Path(config.BASE_DIR) / "data" / "runtime" / "hotel_status.json"
+    detector_heartbeat = False
+    if status_path.is_file():
+        try:
+            data = json.loads(status_path.read_text(encoding="utf-8"))
+            detector_heartbeat = bool(data.get("running")) and bool(data.get("main_loop_heartbeat") or data.get("updated_at"))
+        except Exception:
+            detector_heartbeat = False
+    database = Path(config.HOTEL_DATABASE_PATH).exists()
+    snapshots = {cam: snapshot_info(cam).available for cam in ("A1", "A5")}
+    overall = "ok" if detector_heartbeat and database else "degraded"
+    return {"status": overall, "dashboard": True, "detector_heartbeat": detector_heartbeat, "database": database, "snapshots": snapshots}
 
 
 # ─── Legacy endpoints for backwards compatibility ───────────────────
@@ -338,14 +502,35 @@ def download_excel(authenticated: bool = Depends(check_auth)):
 @app.get("/api/hotel/cameras/{camera_id}/snapshot")
 def get_camera_snapshot(camera_id: str, authenticated: bool = Depends(check_auth)):
     """Servicio para retornar la imagen en tiempo real capturada por el detector."""
-    base = Path(config.BASE_DIR).resolve() / "data" / "runtime"
-    target = (base / f"{camera_id}_latest.jpg").resolve()
-    _verify_path_safe(base, target)
+    try:
+        validate_runtime_camera(camera_id)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Cámara inválida.")
+    target = runtime_snapshot_path(camera_id).resolve()
     if not target.is_file():
-        # Fallback a placeholder o error
-        fallback = WEB_DIR / "style.css"  # dummy fallback check or return 404
-        raise HTTPException(status_code=404, detail="Snapshot not available.")
-    return FileResponse(target, media_type="image/jpeg")
+        raise HTTPException(status_code=404, detail="Snapshot todavía no disponible.")
+    info = snapshot_info(camera_id)
+    if not info.available or not is_valid_jpeg(target):
+        raise HTTPException(status_code=404, detail="Snapshot inválido.")
+    if info.stale:
+        raise HTTPException(status_code=503, detail="Snapshot desactualizado.")
+    return FileResponse(
+        target,
+        media_type="image/jpeg",
+        headers={
+            "Cache-Control": "no-store, no-cache, must-revalidate",
+            "Last-Modified": datetime.fromtimestamp(target.stat().st_mtime).strftime("%a, %d %b %Y %H:%M:%S GMT"),
+        },
+    )
+
+
+@app.get("/api/hotel/cameras/{camera_id}/snapshot/status")
+def get_camera_snapshot_status(camera_id: str, authenticated: bool = Depends(check_auth)):
+    try:
+        info = snapshot_info(camera_id)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Cámara inválida.")
+    return info.__dict__
 
 
 # ─── Auxiliares de Seguridad y URLs ──────────────────────────────────

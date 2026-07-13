@@ -30,6 +30,10 @@ const btnNextPage = document.getElementById("btnNextPage");
 const btnRebuild = document.getElementById("btnRebuild");
 const btnExport = document.getElementById("btnExport");
 const refreshBtn = document.getElementById("refreshBtn");
+const logoutBtn = document.getElementById("logoutBtn");
+const userGreeting = document.getElementById("userGreeting");
+const camA1_overlay = document.getElementById("camA1_overlay");
+const camA5_overlay = document.getElementById("camA5_overlay");
 
 // Modals
 const correctionModal = document.getElementById("correctionModal");
@@ -45,15 +49,39 @@ const videoModalTitle = document.getElementById("videoModalTitle");
 // Pagination State
 let currentPage = 1;
 const pageSize = 15;
+let csrfToken = sessionStorage.getItem("csrfToken") || "";
+const snapshotState = {
+  A1: { loading: false, objectUrl: "", lastOkAt: null, backoffMs: 2000 },
+  A5: { loading: false, objectUrl: "", lastOkAt: null, backoffMs: 2000 }
+};
 
 // Helper to fetch JSON
 async function apiCall(url, options = {}) {
-  const res = await fetch(url, options);
+  const headers = new Headers(options.headers || {});
+  if (["POST", "PATCH", "DELETE"].includes(String(options.method || "GET").toUpperCase()) && csrfToken) {
+    headers.set("X-CSRF-Token", csrfToken);
+  }
+  const res = await fetch(url, {...options, headers, credentials: "same-origin"});
+  if (res.status === 401 && !url.startsWith("/api/auth/")) {
+    window.location.href = "/login";
+    throw new Error("Sesión requerida");
+  }
   if (!res.ok) {
     const err = await res.json().catch(() => ({}));
     throw new Error(err.detail || `HTTP Error ${res.status}`);
   }
   return res.json();
+}
+
+async function loadMe() {
+  try {
+    const me = await apiCall("/api/auth/me");
+    csrfToken = me.csrf_token || csrfToken;
+    if (csrfToken) sessionStorage.setItem("csrfToken", csrfToken);
+    userGreeting.textContent = me.username ? `Hola, ${me.username}` : "Sesión activa";
+  } catch (err) {
+    window.location.href = "/login";
+  }
 }
 
 // Format Datetime
@@ -211,8 +239,6 @@ async function loadStatus() {
       camA1_tracks.textContent = cams.A1.active_tracks;
       camA1_plate.textContent = cams.A1.last_plate ? `${cams.A1.last_plate} (Hab: ${cams.A1.last_room || '?'})` : "-";
       
-      // Update image
-      camA1_img.src = `/api/hotel/cameras/A1/snapshot?t=${Date.now()}`;
     } else {
       camA1_state.textContent = "Desconectado";
       camA1_state.className = "camera-badge";
@@ -227,8 +253,6 @@ async function loadStatus() {
       camA5_tracks.textContent = cams.A5.active_tracks;
       camA5_plate.textContent = cams.A5.last_plate ? `${cams.A5.last_plate} (Hab: ${cams.A5.last_room || '?'})` : "-";
       
-      // Update image
-      camA5_img.src = `/api/hotel/cameras/A5/snapshot?t=${Date.now()}`;
     } else {
       cam5_state.textContent = "Desconectado";
       cam5_state.className = "camera-badge";
@@ -237,6 +261,48 @@ async function loadStatus() {
     detectorStatus.textContent = "○ Servidor Inaccesible";
     detectorStatus.className = "badge-detector offline";
   }
+}
+
+async function refreshSnapshot(cameraId, imgEl, overlayEl) {
+  const state = snapshotState[cameraId];
+  if (state.loading) return;
+  state.loading = true;
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 4000);
+  try {
+    const res = await fetch(`/api/hotel/cameras/${cameraId}/snapshot?ts=${Date.now()}`, {
+      credentials: "same-origin",
+      cache: "no-store",
+      signal: controller.signal
+    });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const type = res.headers.get("Content-Type") || "";
+    if (!type.includes("image/jpeg")) throw new Error("Respuesta no JPEG");
+    const blob = await res.blob();
+    if (!blob.size) throw new Error("JPEG vacío");
+    const url = URL.createObjectURL(blob);
+    const oldUrl = state.objectUrl;
+    imgEl.src = url;
+    state.objectUrl = url;
+    if (oldUrl) URL.revokeObjectURL(oldUrl);
+    state.lastOkAt = new Date();
+    state.backoffMs = 2000;
+    overlayEl.textContent = "EN LÍNEA";
+    overlayEl.className = "snapshot-overlay ok";
+  } catch (err) {
+    const hasImage = Boolean(state.lastOkAt);
+    overlayEl.textContent = hasImage ? `IMAGEN DESACTUALIZADA · ${state.lastOkAt.toLocaleTimeString("es-EC")}` : "SIN IMAGEN";
+    overlayEl.className = hasImage ? "snapshot-overlay warn" : "snapshot-overlay";
+    state.backoffMs = Math.min(state.backoffMs * 1.5, 10000);
+  } finally {
+    clearTimeout(timeout);
+    state.loading = false;
+  }
+}
+
+function refreshSnapshots() {
+  refreshSnapshot("A1", camA1_img, camA1_overlay);
+  refreshSnapshot("A5", camA5_img, camA5_overlay);
 }
 
 // play video in modal
@@ -386,6 +452,15 @@ btnExport.addEventListener("click", async () => {
   }
 });
 
+logoutBtn.addEventListener("click", async () => {
+  try {
+    await apiCall("/api/auth/logout", { method: "POST" });
+  } finally {
+    sessionStorage.removeItem("csrfToken");
+    window.location.href = "/login";
+  }
+});
+
 // Filter submission
 filterForm.addEventListener("submit", (e) => {
   e.preventDefault();
@@ -419,10 +494,14 @@ btnCancelCorrection.addEventListener("click", closeCorrectionModal);
 btnCloseVideoModal.addEventListener("click", closeVideoModal);
 
 // Initial Load
-loadEvents();
-loadStats();
-loadStatus();
+loadMe().then(() => {
+  loadEvents();
+  loadStats();
+  loadStatus();
+  refreshSnapshots();
+});
 
 // Polling routines
 setInterval(loadStatus, 1500); // 1.5s real-time camera stats & status
 setInterval(loadStats, 5000);  // 5s statistics summary
+setInterval(refreshSnapshots, 2000);

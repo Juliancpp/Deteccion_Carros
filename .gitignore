@@ -55,3 +55,7 @@ data/validation/
 
 # Backups locales generados durante hotfixes
 *.bak
+
+# Paquetes privados de despliegue
+dist/deteccion-carros-private.tar.gz
+dist/deteccion-carros-private.tar.gz.sha256

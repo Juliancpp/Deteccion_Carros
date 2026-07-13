@@ -67,7 +67,23 @@ def encode_clip(
     if not frames:
         raise ValueError("Cannot encode an empty frame list.")
 
+    width = int(width) - (int(width) % 2)
+    height = int(height) - (int(height) % 2)
+    if width <= 0 or height <= 0:
+        raise ValueError("Invalid clip dimensions.")
+
+    valid_frames = [
+        item for item in frames
+        if item.get("frame") is not None
+        and isinstance(item.get("frame"), np.ndarray)
+        and item["frame"].size > 0
+        and len(item["frame"].shape) >= 2
+    ]
+    if not valid_frames:
+        raise ValueError("Cannot encode a clip without valid frames.")
+
     os.makedirs(os.path.dirname(output_path), exist_ok=True)
+    tmp_output = output_path + ".tmp.mp4"
 
     cmd = [
         "ffmpeg",
@@ -82,7 +98,7 @@ def encode_clip(
         "-crf", str(crf),
         "-pix_fmt", "yuv420p",
         "-movflags", "+faststart",
-        output_path
+        tmp_output
     ]
 
     process = subprocess.Popen(
@@ -94,7 +110,7 @@ def encode_clip(
     )
 
     try:
-        for item in frames:
+        for item in valid_frames:
             frame = item["frame"]
             
             # Resize frame to target dimensions
@@ -108,18 +124,41 @@ def encode_clip(
             if not success:
                 continue
                 
-            process.stdin.write(jpeg_data.tobytes())
+            try:
+                process.stdin.write(jpeg_data.tobytes())
+            except BrokenPipeError as exc:
+                raise RuntimeError("FFmpeg pipe closed while writing frames.") from exc
 
-        process.stdin.close()
+        if process.stdin:
+            process.stdin.close()
+            process.stdin = None
         stdout, stderr = process.communicate(timeout=15.0)
 
         if process.returncode != 0:
             err_msg = stderr.decode(errors="replace")
             raise RuntimeError(f"FFmpeg returned code {process.returncode}: {err_msg}")
+        os.replace(tmp_output, output_path)
 
+    except subprocess.TimeoutExpired as e:
+        process.kill()
+        try:
+            process.communicate(timeout=2.0)
+        except Exception:
+            pass
+        raise RuntimeError("FFmpeg timed out while encoding clip.") from e
     except Exception as e:
         try:
             process.kill()
+        except Exception:
+            pass
+        try:
+            if process.stdin:
+                process.stdin.close()
+        except Exception:
+            pass
+        try:
+            if os.path.exists(tmp_output):
+                os.remove(tmp_output)
         except Exception:
             pass
         raise e

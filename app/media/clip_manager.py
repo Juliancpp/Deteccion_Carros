@@ -139,15 +139,20 @@ class ClipManager:
         with self.stats_lock:
             return self.pending_jobs_count
 
+    def is_alive(self) -> bool:
+        with self.stats_lock:
+            return self._running and self._thread is not None and self._thread.is_alive()
+
     def _worker_loop(self) -> None:
         """Background loop executing clip encoding tasks."""
         # Open dedicated connection for database updates
-        conn = sqlite3.connect(self.db_path, check_same_thread=False)
+        conn = sqlite3.connect(self.db_path, check_same_thread=False, timeout=10.0)
         conn.row_factory = sqlite3.Row
         
         # Ensure schema is up to date
         try:
             conn.execute("PRAGMA journal_mode=WAL")
+            conn.execute("PRAGMA busy_timeout=10000")
         except Exception:
             pass
 
@@ -162,53 +167,39 @@ class ClipManager:
             except queue.Empty:
                 continue
 
-            event_id = job["event_id"]
-            camera_id = job["camera_id"]
-            anchor_at = job["anchor_at"]
-
-            # Wait until anchor_at + post_seconds has elapsed in real time
-            post_time_needed = anchor_at + timedelta(seconds=self.post_seconds)
-            
-            # Handle tz-awareness comparison
-            now_dt = datetime.now(timezone.utc) if anchor_at.tzinfo else datetime.now()
-            
-            wait_time = (post_time_needed - now_dt).total_seconds()
-            if wait_time > 0:
-                # Wait for post frames to populate in the buffer
-                time.sleep(min(wait_time, 8.0))
-
-            # Compile frames
-            buf = self.get_buffer(camera_id)
-            selected_frames = buf.get_frames_in_range(anchor_at, self.pre_seconds, self.post_seconds)
-
-            if not selected_frames:
-                self._update_db_failed_conn(conn, event_id, "No frames found in camera circular buffer for target time range.")
-                with self.stats_lock:
-                    self.pending_jobs_count = max(0, self.pending_jobs_count - 1)
-                self.queue.task_done()
-                continue
-
-            # Generate target path
-            # Pattern: data/clips/<camera_id>/YYYY-MM-DD/A1_ENTRADA_NORMAL_PDA3463_2026-07-12_13-05-20_<uuid>.mp4
-            date_str = anchor_at.strftime("%Y-%m-%d")
-            time_str = anchor_at.strftime("%Y-%m-%d_%H-%M-%S")
-            evt = job["event_type"]
-            pl = job["plate"] or "NO_LEGIBLE"
-            uid = uuid.uuid4().hex[:6]
-            filename = f"{camera_id}_{evt}_{pl}_{time_str}_{uid}.mp4"
-            
-            relative_clip_path = os.path.join(self.clips_dir, camera_id, date_str, filename)
-            abs_clip_path = os.path.abspath(relative_clip_path)
-
-            metadata = {
-                "camera_id": camera_id,
-                "event_type": evt,
-                "plate": job["plate"],
-                "room_number": job["room_number"],
-                "track_id": job["track_id"]
-            }
-
             try:
+                event_id = job["event_id"]
+                camera_id = job["camera_id"]
+                anchor_at = job["anchor_at"]
+
+                post_time_needed = anchor_at + timedelta(seconds=self.post_seconds)
+                now_dt = datetime.now(timezone.utc) if anchor_at.tzinfo else datetime.now()
+                wait_time = (post_time_needed - now_dt).total_seconds()
+                if wait_time > 0:
+                    time.sleep(min(wait_time, 8.0))
+
+                buf = self.get_buffer(camera_id)
+                selected_frames = buf.get_frames_in_range(anchor_at, self.pre_seconds, self.post_seconds)
+
+                if not selected_frames:
+                    self._update_db_failed_conn(conn, event_id, "No frames found in camera circular buffer for target time range.")
+                    continue
+
+                date_str = anchor_at.strftime("%Y-%m-%d")
+                time_str = anchor_at.strftime("%Y-%m-%d_%H-%M-%S")
+                evt = job["event_type"]
+                pl = job["plate"] or "NO_LEGIBLE"
+                uid = uuid.uuid4().hex[:6]
+                filename = f"{camera_id}_{evt}_{pl}_{time_str}_{uid}.mp4"
+                relative_clip_path = os.path.join(self.clips_dir, camera_id, date_str, filename)
+                abs_clip_path = os.path.abspath(relative_clip_path)
+                metadata = {
+                    "camera_id": camera_id,
+                    "event_type": evt,
+                    "plate": job["plate"],
+                    "room_number": job["room_number"],
+                    "track_id": job["track_id"]
+                }
                 # Encode the clip
                 encode_clip(
                     frames=selected_frames,
@@ -222,12 +213,12 @@ class ClipManager:
                 # Success
                 self._update_db_success_conn(conn, event_id, relative_clip_path)
             except Exception as e:
-                logger.error("Encoding error for event_id %s: %s", event_id, e)
-                self._update_db_failed_conn(conn, event_id, f"FFmpeg compilation error: {e}")
-
-            with self.stats_lock:
-                self.pending_jobs_count = max(0, self.pending_jobs_count - 1)
-            self.queue.task_done()
+                logger.error("Encoding error for event_id %s: %s", job.get("event_id"), e, exc_info=True)
+                self._update_db_failed_conn(conn, job.get("event_id", ""), f"FFmpeg compilation error: {e}")
+            finally:
+                with self.stats_lock:
+                    self.pending_jobs_count = max(0, self.pending_jobs_count - 1)
+                self.queue.task_done()
 
         try:
             conn.close()

@@ -7,11 +7,13 @@ Type=simple
 User=REPLACE_USER
 WorkingDirectory=REPLACE_WORKING_DIR
 Environment=PYTHONUNBUFFERED=1
+Environment=PYTHONFAULTHANDLER=1
 ExecStart=REPLACE_WORKING_DIR/venv/bin/uvicorn app.api:app --host 0.0.0.0 --port 8000 --workers 1
 Restart=always
 RestartSec=5
+StartLimitIntervalSec=0
 KillSignal=SIGTERM
-TimeoutStopSec=10
+TimeoutStopSec=90
 
 [Install]
 WantedBy=multi-user.target

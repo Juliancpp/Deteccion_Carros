@@ -3,11 +3,7 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Control de Acceso Vehicular - Hotel MVP</title>
-  <!-- Google Fonts: Outfit -->
-  <link rel="preconnect" href="https://fonts.googleapis.com">
-  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-  <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+  <title>Control de Acceso Vehicular - Hotel Relax</title>
   <link rel="stylesheet" href="/static/style.css">
 </head>
 <body>
@@ -19,9 +15,11 @@
       <span class="badge-detector" id="detectorStatus">Cargando detector...</span>
     </div>
     <div class="actions">
+      <span id="userGreeting" class="user-greeting">Sesión activa</span>
       <button id="btnRebuild" class="btn-secundario" type="button">Reconstruir Visitas</button>
       <button id="btnExport" class="btn-primario" type="button">Exportar Excel</button>
       <button id="refreshBtn" class="btn-icon" type="button" title="Actualizar Datos">↻</button>
+      <button id="logoutBtn" class="btn-secundario" type="button">Cerrar sesión</button>
     </div>
   </header>
 
@@ -63,7 +61,8 @@
             <span class="camera-badge" id="camA1_state">Desconectado</span>
           </div>
           <div class="camera-frame-container">
-            <img id="camA1_img" src="" alt="Cargando frame A1..." onerror="this.src='/static/style.css'; this.alt='Snapshot no disponible';">
+            <img id="camA1_img" src="" alt="Último frame A1">
+            <div id="camA1_overlay" class="snapshot-overlay">SIN IMAGEN</div>
           </div>
           <div class="camera-stats">
             <div><span>Captura:</span> <strong id="camA1_cap">0 FPS</strong></div>
@@ -80,7 +79,8 @@
             <span class="camera-badge" id="camA5_state">Desconectado</span>
           </div>
           <div class="camera-frame-container">
-            <img id="camA5_img" src="" alt="Cargando frame A5..." onerror="this.src='/static/style.css'; this.alt='Snapshot no disponible';">
+            <img id="camA5_img" src="" alt="Último frame A5">
+            <div id="camA5_overlay" class="snapshot-overlay">SIN IMAGEN</div>
           </div>
           <div class="camera-stats">
             <div><span>Captura:</span> <strong id="camA5_cap">0 FPS</strong></div>

@@ -3,6 +3,7 @@ import os
 import queue
 import threading
 import time
+import traceback
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -21,6 +22,7 @@ from app.hotel.models import HotelVehicleEvent
 from app.hotel.store import HotelStore, classify_event
 from app.hotel.plate_voting import vote_plates_multiframe
 from app.hotel.event_source import validate_hotel_event_source
+from app.safety import safe_crop
 
 logger = logging.getLogger(__name__)
 
@@ -39,6 +41,13 @@ class ConsumerStatus:
     last_error: Optional[str]
     average_processing_ms: float
     total_processing_ms: float
+    consumer_alive: bool = False
+    last_heartbeat_at: Optional[float] = None
+    last_success_at: Optional[float] = None
+    last_error_at: Optional[float] = None
+    consecutive_failures: int = 0
+    total_failures: int = 0
+    oldest_queue_item_age: Optional[float] = None
 
 
 class MultiCameraEvidenceCapture(EvidenceCapture):
@@ -176,6 +185,12 @@ class MultiCameraEventConsumer:
         self._last_error: Optional[str] = None
         self._average_processing_ms = 0.0
         self._total_processing_ms = 0.0
+        self._last_heartbeat_at: Optional[float] = None
+        self._last_success_at: Optional[float] = None
+        self._last_error_at: Optional[float] = None
+        self._consecutive_failures = 0
+        self._total_failures = 0
+        self._max_consecutive_failures = 25
 
     def start(self) -> None:
         """Inicia el hilo de ejecución del consumidor."""
@@ -226,6 +241,13 @@ class MultiCameraEventConsumer:
                 last_error=self._last_error,
                 average_processing_ms=self._average_processing_ms,
                 total_processing_ms=self._total_processing_ms,
+                consumer_alive=self._thread is not None and self._thread.is_alive(),
+                last_heartbeat_at=self._last_heartbeat_at,
+                last_success_at=self._last_success_at,
+                last_error_at=self._last_error_at,
+                consecutive_failures=self._consecutive_failures,
+                total_failures=self._total_failures,
+                oldest_queue_item_age=self._oldest_pending_age_locked(),
             )
 
     def _run_loop(self) -> None:
@@ -251,6 +273,8 @@ class MultiCameraEventConsumer:
                 logger.error("Error al inicializar hotel store en consumidor: %s", e)
 
         while True:
+            with self._lock:
+                self._last_heartbeat_at = time.time()
             # Validar parada y ver si terminamos
             stop_set = self._stop_event.is_set()
             if stop_set:
@@ -275,7 +299,8 @@ class MultiCameraEventConsumer:
             if not self.analyzers:
                 resolved = list(self._pending_events)
                 for p in resolved:
-                    self._process_resolved_candidate(p["candidate"], None)
+                    self._process_candidate_safely(p["candidate"], None)
+                    self._mark_queue_task_done()
                     self._pending_events.remove(p)
                 time.sleep(0.01)
                 continue
@@ -301,7 +326,8 @@ class MultiCameraEventConsumer:
                 # - Ha expirado el tiempo de espera (room_timeout)
                 if is_finalized or room_status in ("CONFIRMADA", "PROBABLE") or elapsed >= self.room_timeout:
                     resolved_list.append(pending)
-                    self._process_resolved_candidate(cand, track_result)
+                    self._process_candidate_safely(cand, track_result)
+                    self._mark_queue_task_done()
 
             for p in resolved_list:
                 self._pending_events.remove(p)
@@ -315,52 +341,66 @@ class MultiCameraEventConsumer:
             except Exception:
                 pass
 
+    def _mark_queue_task_done(self) -> None:
+        queue_obj = getattr(self.coordinator, "_event_queue", None)
+        if queue_obj is None or not hasattr(queue_obj, "task_done"):
+            return
+        try:
+            queue_obj.task_done()
+        except ValueError:
+            logger.debug("Queue task_done omitido: contador ya estaba en cero.")
+
+    def _oldest_pending_age_locked(self) -> Optional[float]:
+        if not self._pending_events:
+            return None
+        return max(0.0, time.monotonic() - min(item["first_seen"] for item in self._pending_events))
+
+    def _process_candidate_safely(self, candidate: EventCandidate, track_result: Optional[Any]) -> None:
+        try:
+            self._process_resolved_candidate(candidate, track_result)
+        except Exception as e:
+            self._record_stage_failure("consumer_wrapper", e)
+            logger.error(
+                "Excepción no controlada procesando candidato %s/%s:\n%s",
+                getattr(candidate, "camera_id", "?"),
+                getattr(candidate, "track_id", "?"),
+                traceback.format_exc(limit=20),
+            )
+
     def _process_candidate(self, candidate: EventCandidate) -> None:
         """Alias de compatibilidad con pruebas unitarias."""
-        self._process_resolved_candidate(candidate, None)
+        self._process_candidate_safely(candidate, None)
+
+    def _record_stage_failure(self, stage: str, exc: Exception) -> None:
+        message = f"{stage}: {type(exc).__name__}: {exc}"
+        with self._lock:
+            self._failed_events += 1
+            self._total_failures += 1
+            self._consecutive_failures += 1
+            self._last_error_at = time.time()
+            self._last_error = message[:500]
+        logger.warning("Fallo controlado en etapa %s: %s", stage, exc, exc_info=True)
+
+    @staticmethod
+    def _append_note(notes: str, reason: str) -> str:
+        return f"{reason}; {notes}" if notes and reason not in notes else (notes or reason)
 
     def _process_resolved_candidate(self, candidate: EventCandidate, track_result: Optional[Any]) -> None:
         """Valida, ejecuta OCR (con votación multiframe), guarda evidencia y persiste los resultados."""
         start_time = time.perf_counter()
         success = False
         is_invalid = False
+        persistence_failed = False
         err_msg = None
 
         try:
-            # 1. Validar frame
+            # 1. Validar frame y bbox
             frame = candidate.frame
-            if (
-                frame is None
-                or not isinstance(frame, np.ndarray)
-                or not hasattr(frame, "shape")
-                or len(frame.shape) < 2
-                or frame.shape[0] == 0
-                or frame.shape[1] == 0
-                or frame.size == 0
-            ):
+            crop_result = safe_crop(frame, candidate.bbox)
+            if crop_result.crop is None or crop_result.bbox is None:
                 is_invalid = True
-                raise ValueError("Frame inválido o vacío en EventCandidate")
-
-            # 2. Validar bbox y recortar
-            h, w = frame.shape[:2]
-            try:
-                x1, y1, x2, y2 = [int(round(float(c))) for c in candidate.bbox]
-            except (ValueError, TypeError) as e:
-                is_invalid = True
-                raise ValueError(f"Coordenadas de bbox inválidas: {candidate.bbox}. {e}")
-
-            if x2 <= x1 or y2 <= y1:
-                is_invalid = True
-                raise ValueError(f"BBox con área o dimensiones no válidas: {candidate.bbox}")
-
-            cx1 = max(0, min(w, x1))
-            cy1 = max(0, min(h, y1))
-            cx2 = max(0, min(w, x2))
-            cy2 = max(0, min(h, y2))
-
-            if cx2 <= cx1 or cy2 <= cy1:
-                is_invalid = True
-                raise ValueError(f"BBox recortado fuera de frame: {candidate.bbox}")
+                raise ValueError(f"Frame/bbox inválido en EventCandidate: {crop_result.reason}")
+            cx1, cy1, cx2, cy2 = crop_result.bbox
 
             # 3. Extraer detalles de movimiento y habitación
             if track_result is not None:
@@ -418,16 +458,10 @@ class MultiCameraEventConsumer:
                 else:
                     frame_id = str(frame_id)
 
-                # Crop del vehículo con padding
-                cw = f_candidate.shape[1]
-                ch = f_candidate.shape[0]
-                cb_x1 = max(0, b_candidate[0] - self._padding)
-                cb_y1 = max(0, b_candidate[1] - self._padding)
-                cb_x2 = min(cw, b_candidate[2] + self._padding)
-                cb_y2 = min(ch, b_candidate[3] + self._padding)
-                vehicle_image = f_candidate[cb_y1:cb_y2, cb_x1:cb_x2].copy()
+                crop = safe_crop(f_candidate, b_candidate, padding=self._padding)
+                vehicle_image = crop.crop
 
-                if vehicle_image.size > 0:
+                if vehicle_image is not None and vehicle_image.size > 0:
                     try:
                         if hasattr(self.plate_reader, "read_all_candidates"):
                             plate_results = self.plate_reader.read_all_candidates(vehicle_image, frame_id=frame_id)
@@ -454,7 +488,14 @@ class MultiCameraEventConsumer:
                         logger.warning("Fallo en lectura OCR individual: %s", e)
 
             # Votación ponderada multiframe
-            voted_res = vote_plates_multiframe(voted_candidates)
+            try:
+                voted_res = vote_plates_multiframe(voted_candidates)
+            except Exception as e:
+                with self._lock:
+                    self._ocr_failures += 1
+                    self._last_error = f"Error en votación multiframe: {e}"
+                logger.warning("Fallo en votación multiframe: %s", e, exc_info=True)
+                voted_res = {"plate": None, "confidence": 0.0, "status": "NO_LEGIBLE", "candidates": []}
             plate_text = voted_res["plate"]
             plate_confidence = voted_res["confidence"]
             plate_status = voted_res["status"]
@@ -506,7 +547,7 @@ class MultiCameraEventConsumer:
                     with self._lock:
                         self._evidence_failures += 1
                         self._last_error = f"Error al guardar evidencia: {e}"
-                    logger.warning("Fallo no crítico guardando evidencia: %s", e)
+                    logger.warning("Fallo no crítico guardando evidencia: %s", e, exc_info=True)
 
             if not evidence_path:
                 review_required = True
@@ -530,8 +571,10 @@ class MultiCameraEventConsumer:
                     with self._lock:
                         self._database_failures += 1
                         self._last_error = f"Fallo al persistir en eventos.db: {e}"
-                    logger.error("Error al guardar en eventos.db: %s", e)
-                    raise
+                    review_required = True
+                    notes = self._append_note(notes, "sqlite eventos.db falló")
+                    persistence_failed = True
+                    logger.error("Error al guardar en eventos.db: %s", e, exc_info=True)
 
             # 8. Persistencia base de datos Hotel MVP (hotel_mvp.db)
             if self.hotel_store:
@@ -558,26 +601,31 @@ class MultiCameraEventConsumer:
                         notes=notes,
                         plate_candidates=plate_candidates_list
                     )
-                    self.hotel_store.save_event_and_update_visit(hotel_event)
+                    self._save_hotel_event_with_retry(hotel_event)
                     
                     if self.clip_manager is not None:
-                        self.clip_manager.request_clip(
-                            event_id=hotel_event.event_id,
-                            camera_id=candidate.camera_id,
-                            anchor_at=candidate.captured_at,
-                            event_type=event_type,
-                            plate=plate_text,
-                            room_number=room_number,
-                            track_id=logical_id
-                        )
+                        try:
+                            self.clip_manager.request_clip(
+                                event_id=hotel_event.event_id,
+                                camera_id=candidate.camera_id,
+                                anchor_at=candidate.captured_at,
+                                event_type=event_type,
+                                plate=plate_text,
+                                room_number=room_number,
+                                track_id=logical_id
+                            )
+                        except Exception as clip_exc:
+                            with self._lock:
+                                self._last_error = f"Fallo al solicitar clip: {clip_exc}"
+                            logger.warning("Fallo no crítico al solicitar clip: %s", clip_exc, exc_info=True)
                 except Exception as e:
                     with self._lock:
                         self._database_failures += 1
                         self._last_error = f"Fallo al persistir en hotel_mvp.db: {e}"
-                    logger.error("Error al guardar en hotel_mvp.db: %s", e)
-                    raise
+                    persistence_failed = True
+                    logger.error("Error al guardar en hotel_mvp.db: %s", e, exc_info=True)
 
-            success = True
+            success = not persistence_failed
 
         except Exception as e:
             err_msg = str(e)
@@ -596,7 +644,27 @@ class MultiCameraEventConsumer:
                 self._last_error = err_msg or "Fallo general de guardado"
             else:
                 self._processed_events += 1
+                self._consecutive_failures = 0
+                self._last_success_at = time.time()
                 self._total_processing_ms += elapsed_ms
                 self._average_processing_ms = (
                     self._total_processing_ms / self._processed_events
                 )
+
+    def _save_hotel_event_with_retry(self, hotel_event: HotelVehicleEvent) -> None:
+        if self.hotel_store is None:
+            return
+        delays = (0.2, 0.5, 1.0)
+        for attempt, delay in enumerate((0.0, *delays), start=1):
+            if delay:
+                time.sleep(delay)
+            try:
+                self.hotel_store.save_event_and_update_visit(hotel_event)
+                return
+            except Exception as exc:
+                text = str(exc).lower()
+                if "database is locked" not in text and "database is busy" not in text:
+                    raise
+                if attempt > len(delays):
+                    raise
+                logger.warning("SQLite ocupado guardando evento %s; reintento %s", hotel_event.event_id, attempt)

@@ -23,6 +23,7 @@ from app.settings import load_settings
 from app.ocr import PlateReader
 from app.export.excel_exporter import HotelExcelExporter
 from app.hotel.store import HotelStore
+from app.runtime import atomic_write_jpeg, atomic_write_json, runtime_snapshot_path, snapshot_info
 import app.config as config
 
 _shutdown_requested = False
@@ -45,6 +46,7 @@ def main() -> int:
     args = parse_args()
     shutdown_event = _install_signal_handlers()
     started = time.monotonic()
+    started_wall = datetime.now()
     cpu_started = time.process_time()
     ram_started = _rss_mb()
 
@@ -95,6 +97,7 @@ def main() -> int:
     )
 
     last_sequences = {camera.camera_id: 0 for camera in cameras}
+    last_snapshot_write = {camera.camera_id: 0.0 for camera in cameras}
     exit_code = 0
 
     try:
@@ -110,60 +113,67 @@ def main() -> int:
 
         while time.monotonic() < end_at and not shutdown_event.is_set():
             for camera in cameras:
-                result = coordinator.get_latest_result(camera.camera_id, after_sequence=last_sequences[camera.camera_id])
-                if result is None:
-                    continue
+                try:
+                    result = coordinator.get_latest_result(camera.camera_id, after_sequence=last_sequences[camera.camera_id])
+                    if result is None:
+                        continue
 
-                last_sequences[camera.camera_id] = result.source_sequence
+                    last_sequences[camera.camera_id] = result.source_sequence
 
-                # Feed clip buffers
-                if clip_manager is not None and result.raw_frame is not None:
-                    clip_manager.add_frame(
-                        camera_id=camera.camera_id,
-                        captured_at=result.captured_at,
-                        sequence=result.source_sequence,
-                        frame=result.raw_frame
-                    )
+                    # Feed clip buffers
+                    if clip_manager is not None and result.raw_frame is not None:
+                        try:
+                            clip_manager.add_frame(
+                                camera_id=camera.camera_id,
+                                captured_at=result.captured_at,
+                                sequence=result.source_sequence,
+                                frame=result.raw_frame
+                            )
+                        except Exception as exc:
+                            print(f"[RUNNER] Clip buffer fallo en {camera.camera_id}: {exc}")
 
-                # Save snapshots in real time atomically
-                if args.latest_snapshots and result.raw_frame is not None:
-                    snapshot_filename = f"{camera.camera_id}_latest.jpg"
-                    snapshot_path = os.path.join(config.BASE_DIR, "data", "runtime", snapshot_filename)
-                    tmp_path = snapshot_path + ".tmp"
-                    try:
-                        import cv2
-                        cv2.imwrite(tmp_path, result.raw_frame)
-                        os.replace(tmp_path, snapshot_path)
-                    except Exception:
-                        pass
+                    # Save snapshots in real time atomically, max 1/s per camera.
+                    now_mono = time.monotonic()
+                    if args.latest_snapshots and result.raw_frame is not None and now_mono - last_snapshot_write[camera.camera_id] >= 1.0:
+                        try:
+                            if atomic_write_jpeg(runtime_snapshot_path(camera.camera_id), result.raw_frame):
+                                last_snapshot_write[camera.camera_id] = now_mono
+                        except Exception as exc:
+                            print(f"[RUNNER] Snapshot fallo en {camera.camera_id}: {exc}")
 
-                # 1. Alimentar TrackFrameBuffer con el frame limpio (raw_frame o annotated)
-                frame_to_buffer = result.raw_frame if result.raw_frame is not None else result.annotated_frame
-                if frame_to_buffer is not None:
-                    for vehicle in result.tracked_vehicles:
-                        frame_buffer.add(
-                            camera_id=camera.camera_id,
-                            track_id=vehicle["track_id"],
-                            frame=frame_to_buffer,
-                            vehicle=vehicle,
-                            captured_at=result.captured_at
+                    # 1. Alimentar TrackFrameBuffer con el frame limpio (raw_frame o annotated)
+                    frame_to_buffer = result.raw_frame if result.raw_frame is not None else result.annotated_frame
+                    if frame_to_buffer is not None:
+                        for vehicle in result.tracked_vehicles:
+                            try:
+                                frame_buffer.add(
+                                    camera_id=camera.camera_id,
+                                    track_id=vehicle["track_id"],
+                                    frame=frame_to_buffer,
+                                    vehicle=vehicle,
+                                    captured_at=result.captured_at
+                                )
+                            except Exception as exc:
+                                print(f"[RUNNER] Frame buffer fallo en {camera.camera_id}: {exc}")
+
+                    # 2. Actualizar el HotelPhase1Analyzer
+                    if result.annotated_frame is not None:
+                        analyzers[camera.camera_id].update(
+                            tracked_vehicles=result.tracked_vehicles,
+                            frame=result.annotated_frame,
+                            captured_at=result.captured_at,
+                            frame_width=result.annotated_frame.shape[1],
+                            frame_height=result.annotated_frame.shape[0],
                         )
-
-                # 2. Actualizar el HotelPhase1Analyzer
-                if result.annotated_frame is not None:
-                    analyzers[camera.camera_id].update(
-                        tracked_vehicles=result.tracked_vehicles,
-                        frame=result.annotated_frame,
-                        captured_at=result.captured_at,
-                        frame_width=result.annotated_frame.shape[1],
-                        frame_height=result.annotated_frame.shape[0],
-                    )
+                except Exception as exc:
+                    print(f"[RUNNER] Resultado inválido aislado en {camera.camera_id}: {exc}")
+                    continue
 
             now = time.monotonic()
             if now >= next_status:
                 _print_status(coordinator, analyzers, consumer)
                 if args.status_file:
-                    _write_status_json(args.status_file, coordinator, analyzers, consumer, clip_manager)
+                    _write_status_json(args.status_file, coordinator, analyzers, consumer, clip_manager, started, started_wall)
                 next_status = now + args.status_interval
 
             shutdown_event.wait(0.02)
@@ -236,7 +246,7 @@ def _print_status(coordinator, analyzers, consumer):
     print()
 
 
-def _write_status_json(status_file: str, coordinator, analyzers, consumer, clip_manager):
+def _write_status_json(status_file: str, coordinator, analyzers, consumer, clip_manager, started_mono: float, started_wall: datetime):
     coord_status = coordinator.get_status()
     cons_status = consumer.get_status()
 
@@ -253,8 +263,8 @@ def _write_status_json(status_file: str, coordinator, analyzers, consumer, clip_
         review_pending = stats["review_pending"]
         ocr_completed = stats["ocr_completed"]
         store.close()
-    except Exception:
-        pass
+    except Exception as exc:
+        print(f"[RUNNER] Status DB stats fallo: {exc}")
 
     clip_pending = clip_manager.get_pending_count() if clip_manager else 0
     camera_data = {}
@@ -288,8 +298,20 @@ def _write_status_json(status_file: str, coordinator, analyzers, consumer, clip_
 
     status_dict = {
         "updated_at": datetime.now().isoformat(),
+        "process_started_at": started_wall.isoformat(),
+        "process_uptime_seconds": round(time.monotonic() - started_mono, 3),
+        "main_loop_heartbeat": datetime.now().isoformat(),
         "running": True,
         "model_loads": int(coord_status.model_load_count),
+        "consumer_alive": bool(cons_status.consumer_alive),
+        "clip_manager_alive": bool(clip_manager and getattr(clip_manager, "is_alive", lambda: False)()),
+        "last_successful_event_at": cons_status.last_success_at,
+        "last_event_error": cons_status.last_error,
+        "consecutive_event_failures": cons_status.consecutive_failures,
+        "snapshot_age_seconds": {
+            "A1": snapshot_info("A1").age_seconds,
+            "A5": snapshot_info("A5").age_seconds,
+        },
         "events_saved": int(events_saved),
         "visits_open": int(visits_open),
         "review_pending": int(review_pending),
@@ -298,14 +320,10 @@ def _write_status_json(status_file: str, coordinator, analyzers, consumer, clip_
         "cameras": camera_data
     }
 
-    tmp_file = status_file + ".tmp"
     try:
-        os.makedirs(os.path.dirname(status_file), exist_ok=True)
-        with open(tmp_file, "w", encoding="utf-8") as f:
-            json.dump(status_dict, f, indent=2, ensure_ascii=False)
-        os.replace(tmp_file, status_file)
-    except Exception:
-        pass
+        atomic_write_json(status_file, status_dict)
+    except Exception as exc:
+        print(f"[RUNNER] Escritura status JSON fallo: {exc}")
 
 
 def _write_stopped_status_json(status_file: str):
@@ -321,10 +339,9 @@ def _write_stopped_status_json(status_file: str):
             "clip_jobs_pending": 0,
             "cameras": {}
         }
-        with open(status_file, "w", encoding="utf-8") as f:
-            json.dump(status_dict, f, indent=2, ensure_ascii=False)
-    except Exception:
-        pass
+        atomic_write_json(status_file, status_dict)
+    except Exception as exc:
+        print(f"[RUNNER] Escritura stopped status fallo: {exc}")
 
 
 def _stop_streams(coordinator) -> bool:

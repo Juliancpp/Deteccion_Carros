@@ -7,11 +7,13 @@ Type=simple
 User=REPLACE_USER
 WorkingDirectory=REPLACE_WORKING_DIR
 Environment=PYTHONUNBUFFERED=1
+Environment=PYTHONFAULTHANDLER=1
 ExecStart=REPLACE_WORKING_DIR/venv/bin/python scripts/run_hotel_mvp.py --continuous --status-file data/runtime/hotel_status.json --latest-snapshots --enable-clips
 Restart=always
 RestartSec=5
+StartLimitIntervalSec=0
 KillSignal=SIGINT
-TimeoutStopSec=15
+TimeoutStopSec=90
 
 [Install]
 WantedBy=multi-user.target

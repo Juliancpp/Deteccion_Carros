@@ -10,6 +10,7 @@ from typing import Optional
 
 import cv2
 import numpy as np
+from app.safety import safe_crop
 
 try:
     from app.config import CAPTURE_DIR, CAPTURE_ENABLED, PADDING_CAPTURE
@@ -46,6 +47,8 @@ class EvidenceCapture:
             return None
 
         crop, relative_bbox = self._crop_vehicle(frame, vehicle["bbox"])
+        if crop is None or crop.size == 0:
+            raise ValueError("No se puede guardar evidencia con crop vacío")
         annotated = self._draw_evidence(crop, relative_bbox, vehicle, event)
         filepath = self._build_filepath(event)
 
@@ -57,22 +60,18 @@ class EvidenceCapture:
 
     def _crop_vehicle(self, frame: np.ndarray, bbox: list):
         """Recorta el vehículo con padding y devuelve bbox relativo al recorte."""
-        height, width = frame.shape[:2]
+        result = safe_crop(frame, bbox, padding=self.padding)
+        if result.crop is None or result.bbox is None:
+            return None, [0, 0, 0, 0]
+        crop_x1, crop_y1, _crop_x2, _crop_y2 = result.bbox
         x1, y1, x2, y2 = [int(value) for value in bbox]
-
-        crop_x1 = max(0, x1 - self.padding)
-        crop_y1 = max(0, y1 - self.padding)
-        crop_x2 = min(width, x2 + self.padding)
-        crop_y2 = min(height, y2 + self.padding)
-
-        crop = frame[crop_y1:crop_y2, crop_x1:crop_x2].copy()
         relative_bbox = [
             x1 - crop_x1,
             y1 - crop_y1,
             x2 - crop_x1,
             y2 - crop_y1,
         ]
-        return crop, relative_bbox
+        return result.crop, relative_bbox
 
     def _draw_evidence(
         self,
