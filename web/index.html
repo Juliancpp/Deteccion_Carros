@@ -3,65 +3,285 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Deteccion_Carros Dashboard</title>
+  <title>Control de Acceso Vehicular - Hotel MVP</title>
+  <!-- Google Fonts: Outfit -->
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;500;600;700&display=swap" rel="stylesheet">
   <link rel="stylesheet" href="/static/style.css">
-  <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
 </head>
 <body>
+
+  <!-- Topbar -->
   <header class="topbar">
-    <div>
-      <h1>Deteccion_Carros</h1>
-      <p>Eventos vehiculares en tiempo real</p>
+    <div class="brand">
+      <h1>Control Vehicular</h1>
+      <span class="badge-detector" id="detectorStatus">Cargando detector...</span>
     </div>
-    <button id="refreshBtn" type="button">Actualizar</button>
+    <div class="actions">
+      <button id="btnRebuild" class="btn-secundario" type="button">Reconstruir Visitas</button>
+      <button id="btnExport" class="btn-primario" type="button">Exportar Excel</button>
+      <button id="refreshBtn" class="btn-icon" type="button" title="Actualizar Datos">↻</button>
+    </div>
   </header>
 
   <main>
-    <section class="stats-grid" aria-label="Estadísticas del día">
+    <!-- Stats Grid -->
+    <section class="stats-grid" aria-label="Métricas de Operación">
       <article class="stat-card">
-        <span>Entradas hoy</span>
-        <strong id="entradasHoy">0</strong>
+        <span class="stat-title">Entradas Hoy</span>
+        <strong id="statEntradas" class="stat-value">0</strong>
       </article>
       <article class="stat-card">
-        <span>Salidas hoy</span>
-        <strong id="salidasHoy">0</strong>
+        <span class="stat-title">Salidas Hoy</span>
+        <strong id="statSalidas" class="stat-value">0</strong>
       </article>
       <article class="stat-card">
-        <span>Total vehículos</span>
-        <strong id="totalVehiculos">0</strong>
+        <span class="stat-title">Visitas Activas</span>
+        <strong id="statVisitasActivas" class="stat-value">0</strong>
+      </article>
+      <article class="stat-card">
+        <span class="stat-title">Revisión Pendiente</span>
+        <strong id="statRevision" class="stat-value warning-text">0</strong>
+      </article>
+      <article class="stat-card">
+        <span class="stat-title">Placas Identificadas</span>
+        <strong id="statOcr" class="stat-value">0</strong>
       </article>
     </section>
 
-    <section class="chart-section">
-      <div class="section-header">
-        <h2>Vehículos por hora</h2>
+    <!-- Cameras Live Grid -->
+    <section class="cameras-section">
+      <div class="section-title">
+        <h2>Monitoreo en Tiempo Real (A1 & A5)</h2>
       </div>
-      <div class="chart-wrap">
-        <canvas id="hourlyChart"></canvas>
+      <div class="cameras-grid">
+        <!-- Camara A1 -->
+        <article class="camera-card">
+          <div class="camera-header">
+            <h3>Cámara A1 - Entrada</h3>
+            <span class="camera-badge" id="camA1_state">Desconectado</span>
+          </div>
+          <div class="camera-frame-container">
+            <img id="camA1_img" src="" alt="Cargando frame A1..." onerror="this.src='/static/style.css'; this.alt='Snapshot no disponible';">
+          </div>
+          <div class="camera-stats">
+            <div><span>Captura:</span> <strong id="camA1_cap">0 FPS</strong></div>
+            <div><span>Inferencia:</span> <strong id="camA1_inf">0 FPS</strong></div>
+            <div><span>Tracks Activos:</span> <strong id="camA1_tracks">0</strong></div>
+            <div><span>Placa Reciente:</span> <strong id="camA1_plate">-</strong></div>
+          </div>
+        </article>
+
+        <!-- Camara A5 -->
+        <article class="camera-card">
+          <div class="camera-header">
+            <h3>Cámara A5 - Salida</h3>
+            <span class="camera-badge" id="camA5_state">Desconectado</span>
+          </div>
+          <div class="camera-frame-container">
+            <img id="camA5_img" src="" alt="Cargando frame A5..." onerror="this.src='/static/style.css'; this.alt='Snapshot no disponible';">
+          </div>
+          <div class="camera-stats">
+            <div><span>Captura:</span> <strong id="camA5_cap">0 FPS</strong></div>
+            <div><span>Inferencia:</span> <strong id="camA5_inf">0 FPS</strong></div>
+            <div><span>Tracks Activos:</span> <strong id="camA5_tracks">0</strong></div>
+            <div><span>Placa Reciente:</span> <strong id="camA5_plate">-</strong></div>
+          </div>
+        </article>
       </div>
     </section>
 
+    <!-- Filters Section -->
+    <section class="filters-card">
+      <form id="filterForm" class="filters-grid">
+        <div class="filter-field">
+          <label for="filterPlate">Placa</label>
+          <input type="text" id="filterPlate" placeholder="Ej. PDA3463">
+        </div>
+        <div class="filter-field">
+          <label for="filterCamera">Cámara</label>
+          <select id="filterCamera">
+            <option value="">Todas</option>
+            <option value="A1">A1 - Entrada</option>
+            <option value="A5">A5 - Salida</option>
+          </select>
+        </div>
+        <div class="filter-field">
+          <label for="filterType">Tipo de Movimiento</label>
+          <select id="filterType">
+            <option value="">Todos</option>
+            <option value="ENTRADA_NORMAL">Entrada Normal</option>
+            <option value="SALIDA_NORMAL">Salida Normal</option>
+            <option value="ENTRADA_POR_SALIDA">Entrada x Salida</option>
+            <option value="SALIDA_POR_ENTRADA">Salida x Entrada</option>
+            <option value="SALIDA_SIN_ENTRADA">Salida sin Entrada</option>
+            <option value="EVENTO_NO_RESUELTO">No Resuelto</option>
+          </select>
+        </div>
+        <div class="filter-field">
+          <label for="filterRoom">Habitación</label>
+          <input type="number" id="filterRoom" placeholder="Ej. 104">
+        </div>
+        <div class="filter-field">
+          <label for="filterPlateStatus">Estado Placa</label>
+          <select id="filterPlateStatus">
+            <option value="">Todos</option>
+            <option value="LEIDA">Leída</option>
+            <option value="PARCIAL">Parcial</option>
+            <option value="NO_LEGIBLE">No Legible</option>
+          </select>
+        </div>
+        <div class="filter-field">
+          <label for="filterReview">Estado Revisión</label>
+          <select id="filterReview">
+            <option value="">Todos</option>
+            <option value="true">Requiere Revisión</option>
+            <option value="false">Resuelto / OK</option>
+          </select>
+        </div>
+        <div class="filter-field">
+          <label for="filterDateFrom">Desde</label>
+          <input type="date" id="filterDateFrom">
+        </div>
+        <div class="filter-field">
+          <label for="filterDateTo">Hasta</label>
+          <input type="date" id="filterDateTo">
+        </div>
+        <div class="filter-actions">
+          <button type="submit" class="btn-primario" style="width: 100%;">Buscar</button>
+        </div>
+      </form>
+    </section>
+
+    <!-- Events Feed -->
     <section class="events-section">
       <div class="section-header">
-        <h2>Últimos eventos</h2>
-        <span id="statusText">Cargando...</span>
+        <h2>Historial de Tránsito Vehicular</h2>
+        <span id="eventsMeta">Cargando historial...</span>
       </div>
       <div class="table-wrap">
         <table>
           <thead>
             <tr>
-              <th>Fecha</th>
-              <th>Hora</th>
+              <th>Fecha/Hora</th>
+              <th>Cámara</th>
+              <th>Movimiento</th>
               <th>Placa</th>
-              <th>Tipo</th>
-              <th>Imagen</th>
+              <th>Habitación</th>
+              <th>Notas/Validación</th>
+              <th>Evidencias</th>
+              <th>Acciones</th>
             </tr>
           </thead>
-          <tbody id="eventsTable"></tbody>
+          <tbody id="eventsTable">
+            <tr>
+              <td colspan="8" class="empty">Buscando registros en la base de datos...</td>
+            </tr>
+          </tbody>
         </table>
+      </div>
+      
+      <!-- Pagination -->
+      <div class="pagination">
+        <button id="btnPrevPage" disabled>◄ Anterior</button>
+        <span id="pageIndicator">Página 1 de 1</span>
+        <button id="btnNextPage" disabled>Siguiente ►</button>
       </div>
     </section>
   </main>
+
+  <!-- Correction Modal -->
+  <div id="correctionModal" class="modal-overlay hidden">
+    <div class="modal-card">
+      <div class="modal-header">
+        <h2>Corrección Manual de Evento</h2>
+        <button type="button" class="close-modal-btn" id="btnCloseModal">×</button>
+      </div>
+      <form id="correctionForm" class="modal-body">
+        <input type="hidden" id="modalEventId">
+        
+        <div class="form-row">
+          <div class="form-group">
+            <label for="modalPlate">Placa Corregida</label>
+            <input type="text" id="modalPlate" required>
+          </div>
+          <div class="form-group">
+            <label for="modalPlateStatus">Estado Lectura</label>
+            <select id="modalPlateStatus">
+              <option value="LEIDA">LEIDA</option>
+              <option value="PARCIAL">PARCIAL</option>
+              <option value="NO_LEGIBLE">NO_LEGIBLE</option>
+            </select>
+          </div>
+        </div>
+
+        <div class="form-row">
+          <div class="form-group">
+            <label for="modalRoom">Habitación Asignada</label>
+            <input type="number" id="modalRoom" placeholder="Ej. 105">
+          </div>
+          <div class="form-group">
+            <label for="modalRoomStatus">Estado Habitación</label>
+            <select id="modalRoomStatus">
+              <option value="CONFIRMADA">CONFIRMADA</option>
+              <option value="PROBABLE">PROBABLE</option>
+              <option value="NO_DETERMINADA">NO_DETERMINADA</option>
+            </select>
+          </div>
+        </div>
+
+        <div class="form-row">
+          <div class="form-group">
+            <label for="modalEventType">Clasificación del Evento</label>
+            <select id="modalEventType">
+              <option value="ENTRADA_NORMAL">ENTRADA_NORMAL</option>
+              <option value="SALIDA_NORMAL">SALIDA_NORMAL</option>
+              <option value="ENTRADA_POR_SALIDA">ENTRADA_POR_SALIDA</option>
+              <option value="SALIDA_POR_ENTRADA">SALIDA_POR_ENTRADA</option>
+              <option value="SALIDA_SIN_ENTRADA">SALIDA_SIN_ENTRADA</option>
+              <option value="EVENTO_NO_RESUELTO">EVENTO_NO_RESUELTO</option>
+            </select>
+          </div>
+          <div class="form-group inline-checkbox">
+            <input type="checkbox" id="modalReviewRequired">
+            <label for="modalReviewRequired">Requiere mayor auditoría</label>
+          </div>
+        </div>
+
+        <div class="form-group">
+          <label for="modalNotes">Notas de la Corrección (Auditoría)</label>
+          <textarea id="modalNotes" rows="3" required placeholder="Escriba la razón de la corrección manual..."></textarea>
+        </div>
+
+        <!-- Audit log inside modal -->
+        <div class="audit-history">
+          <h4>Historial de Edición</h4>
+          <div id="modalAuditLogs" class="audit-logs-container">
+            <span class="empty-text">Sin auditorías previas.</span>
+          </div>
+        </div>
+
+        <div class="modal-footer">
+          <button type="button" class="btn-secundario" id="btnCancelCorrection">Cancelar</button>
+          <button type="submit" class="btn-primario" id="btnSaveCorrection">Guardar Cambios</button>
+        </div>
+      </form>
+    </div>
+  </div>
+
+  <!-- Video Playback Modal -->
+  <div id="videoModal" class="modal-overlay hidden">
+    <div class="modal-card video-card">
+      <div class="modal-header">
+        <h2 id="videoModalTitle">Reproducción de Evidencia</h2>
+        <button type="button" class="close-modal-btn" id="btnCloseVideoModal">×</button>
+      </div>
+      <div class="modal-body video-container">
+        <video id="evidenceVideo" controls autoplay muted width="100%"></video>
+      </div>
+    </div>
+  </div>
 
   <script src="/static/app.js"></script>
 </body>

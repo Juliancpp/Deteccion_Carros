@@ -24,3 +24,21 @@ class EventCandidate:
     frame: Any | None
     track_point: tuple[int, int] | None = None
     corridor_progress: float | None = None
+    
+    # Nuevos campos requeridos para inmutabilidad y consistencia
+    captured_at: datetime = None
+    vehicle_class: str = ""
+    detection_confidence: float = 0.0
+    logical_id: int | None = None
+
+
+    def __post_init__(self):
+        if self.captured_at is None:
+            object.__setattr__(self, "captured_at", self.occurred_at)
+        if not self.vehicle_class:
+            object.__setattr__(self, "vehicle_class", self.class_name)
+        if not self.detection_confidence:
+            object.__setattr__(self, "detection_confidence", self.confidence)
+        if self.frame is not None and hasattr(self.frame, "copy"):
+            object.__setattr__(self, "frame", self.frame.copy())
+

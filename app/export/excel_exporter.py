@@ -2,7 +2,8 @@ from __future__ import annotations
 
 import os
 import tempfile
-from datetime import datetime
+import datetime
+from datetime import datetime as dt_class
 
 from openpyxl import Workbook
 from openpyxl.styles import Font, PatternFill
@@ -18,13 +19,22 @@ class HotelExcelExporter:
 
     def export(self) -> str:
         wb = Workbook()
+        
+        # 1. Eventos
         events_ws = wb.active
         events_ws.title = "Eventos"
+        
+        # 2. Visitas
         visits_ws = wb.create_sheet("Visitas")
-        review_ws = wb.create_sheet("Revision")
+        
+        # 3. Revisión
+        review_ws = wb.create_sheet("Revisión")
+        
         self._write_events(events_ws)
         self._write_visits(visits_ws)
         self._write_review(review_ws)
+        
+        # Guardado atómico
         os.makedirs(os.path.dirname(self.output_path), exist_ok=True)
         fd, tmp_path = tempfile.mkstemp(prefix="control_vehiculos_", suffix=".xlsx", dir=os.path.dirname(self.output_path))
         os.close(fd)
@@ -44,7 +54,7 @@ class HotelExcelExporter:
         ]
         rows = []
         for event in self.store.list_events():
-            occurred = parse_dt(event["occurred_at"]) or datetime.now()
+            occurred = parse_dt(event["occurred_at"]) or dt_class.now()
             rows.append([
                 event["event_id"], occurred.date(), occurred.time().replace(microsecond=0), event["camera_id"],
                 event["track_id"], event["movement"], event["event_type"], event["plate"] or "",
@@ -67,6 +77,7 @@ class HotelExcelExporter:
             duration = ""
             if entry_at and exit_at:
                 duration = round((exit_at - entry_at).total_seconds() / 60, 1)
+                
             rows.append([
                 visit["visit_id"], visit["plate"], visit["entry_at"] or "", visit["entry_camera"] or "",
                 visit["room_number"] or "", visit["exit_at"] or "", visit["exit_camera"] or "",
@@ -82,7 +93,7 @@ class HotelExcelExporter:
             if not event["plate"]:
                 reasons.append("sin placa")
             if event["plate_status"] != "LEIDA":
-                reasons.append("placa baja/no legible")
+                reasons.append("placa no legible")
             if event["room_status"] == "NO_DETERMINADA":
                 reasons.append("habitacion no determinada")
             if event["event_type"] in {"SALIDA_SIN_ENTRADA", "EVENTO_NO_RESUELTO"}:
@@ -103,10 +114,36 @@ def _write_table(ws, headers: list[str], rows: list[list]) -> None:
     for cell in ws[1]:
         cell.font = Font(bold=True, color="FFFFFF")
         cell.fill = fill
-    for row in rows:
-        ws.append(row)
+
+    for row_data in rows:
+        ws.append(row_data)
+
     ws.freeze_panes = "A2"
     ws.auto_filter.ref = ws.dimensions
+
+    # Aplicar formato de número y enlaces a las celdas de datos
+    for r_idx in range(2, ws.max_row + 1):
+        for c_idx in range(1, ws.max_column + 1):
+            cell = ws.cell(row=r_idx, column=c_idx)
+            val = cell.value
+            
+            # Formatos de fecha y hora
+            if isinstance(val, datetime.date) and not isinstance(val, dt_class):
+                cell.number_format = "yyyy-mm-dd"
+            elif isinstance(val, dt_class):
+                cell.number_format = "yyyy-mm-dd hh:mm:ss"
+            elif isinstance(val, datetime.time):
+                cell.number_format = "hh:mm:ss"
+            
+            # Hipervínculos a evidencias
+            if isinstance(val, str) and (val.endswith(".jpg") or val.endswith(".png")):
+                if os.path.exists(val):
+                    # Enlace relativo para facilitar clic local
+                    cell.hyperlink = val
+                    cell.style = "Hyperlink"
+                    cell.font = Font(color="0563C1", underline="single")
+
+    # Ajustar ancho de columnas
     for column_cells in ws.columns:
         max_len = max(len(str(cell.value or "")) for cell in column_cells)
         ws.column_dimensions[get_column_letter(column_cells[0].column)].width = min(max(12, max_len + 2), 60)

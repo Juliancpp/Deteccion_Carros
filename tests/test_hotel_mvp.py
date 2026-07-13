@@ -19,6 +19,7 @@ def event(event_type="ENTRADA_NORMAL", plate="PDA3463", camera_id="A1", movement
         camera_name=f"Camara_{camera_id}",
         track_id=1,
         movement=movement,
+        movement_confidence=0.85,
         event_type=event_type,
         plate=plate,
         plate_confidence=0.8 if plate else 0.0,

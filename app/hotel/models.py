@@ -20,6 +20,12 @@ class RoomDecision:
     room_number: int | None
     room_confidence: float
     room_status: str
+    room_score_breakdown: dict[str, float] = field(default_factory=dict)
+    room_runner_up: int | None = None
+    room_vote_margin: float = 0.0
+    passed_in_front_only: bool = False
+    review_required: bool = False
+    review_reasons: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -38,6 +44,7 @@ class HotelVehicleEvent:
     camera_name: str
     track_id: int
     movement: str
+    movement_confidence: float
     event_type: str
     plate: str | None
     plate_confidence: float
@@ -51,3 +58,14 @@ class HotelVehicleEvent:
     review_required: bool
     notes: str = ""
     plate_candidates: list[dict[str, Any]] = field(default_factory=list)
+    logical_vehicle_id: int | None = None
+    original_track_ids_json: str | None = None
+    plate_raw_candidates_json: str | None = None
+    plate_runner_up: str | None = None
+    plate_runner_up_confidence: float = 0.0
+    plate_vote_margin: float = 0.0
+    plate_supporting_frames_json: str | None = None
+    room_score_breakdown_json: str | None = None
+    room_runner_up: int | None = None
+    room_vote_margin: float = 0.0
+    review_reasons_json: str | None = None

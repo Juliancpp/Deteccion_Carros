@@ -1,0 +1,31 @@
+# Configuración de Nginx para Deteccion_Carros (Hotel MVP)
+# Copiar a /etc/nginx/sites-available/deteccion-carros y crear enlace simbólico en sites-enabled
+
+server {
+    listen 80;
+    server_name _; # O ip del servidor / nombre DNS
+
+    # Servir archivos estáticos del frontend directamente por Nginx (más rápido)
+    location /static/ {
+        alias REPLACE_WORKING_DIR/web/;
+        expires 1d;
+        add_header Cache-Control "public";
+    }
+
+    # Redireccionar el resto de las peticiones a Uvicorn / Gunicorn
+    location / {
+        proxy_pass http://127.0.0.1:8000;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+
+        # WebSocket support (si se requiere a futuro)
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection "upgrade";
+    }
+
+    # Restringir tamaño máximo de carga (por ejemplo, para fotos de evidencia si las subiera el front)
+    client_max_body_size 20M;
+}

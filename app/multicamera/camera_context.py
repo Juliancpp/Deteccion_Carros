@@ -21,6 +21,7 @@ class CameraContext:
     last_result: Any | None = None
     last_stream_connected: bool = False
     last_reconnect_count: int = 0
+    last_loop_count: int = 0
     inference_count: int = 0
     inference_ms_last: float = 0.0
     inference_ms_total: float = 0.0
@@ -51,6 +52,7 @@ class CameraInferenceResult:
     detections_count: int
     tracked_vehicles: tuple[dict[str, Any], ...]
     annotated_frame: Any | None = None
+    raw_frame: Any | None = None
 
 
 @dataclass(frozen=True)

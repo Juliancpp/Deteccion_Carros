@@ -74,6 +74,8 @@ class StreamStatus:
     read_error_count: int
     consecutive_read_failures: int
     last_error: str | None
+    loop_count: int = 0
+
 
 
 class RTSPStream:
@@ -96,8 +98,24 @@ class RTSPStream:
     ) -> None:
         self.dvr_settings = dvr_settings
         self.camera_settings = camera_settings
-        self._url = build_rtsp_url(dvr_settings, camera_settings)
-        self._safe_url = sanitize_rtsp_url(self._url)
+        
+        self.video_path = getattr(camera_settings, "video_path", None)
+        self._is_local_file = False
+        self._is_webcam = False
+        self._loop_count = 0
+
+        if self.video_path is not None:
+            if str(self.video_path).isdigit():
+                self._url = int(self.video_path)
+                self._is_webcam = True
+            else:
+                self._url = self.video_path
+                self._is_local_file = True
+            self._safe_url = str(self._url)
+        else:
+            self._url = build_rtsp_url(dvr_settings, camera_settings)
+            self._safe_url = sanitize_rtsp_url(self._url)
+            
         self._capture_factory = capture_factory or self._default_capture_factory
         self._rtsp_transport = rtsp_transport
         self._open_timeout_ms = int(open_timeout_ms)
@@ -225,6 +243,7 @@ class RTSPStream:
                 read_error_count=self._read_error_count,
                 consecutive_read_failures=self._consecutive_read_failures,
                 last_error=self._last_error,
+                loop_count=self._loop_count,
             )
 
     def wait_until_connected(self, timeout: float) -> bool:
@@ -267,7 +286,21 @@ class RTSPStream:
 
     def _read_loop(self, capture: Any) -> str:
         last_success = time.monotonic()
+        
+        frame_delay = 0.0
+        if self._is_local_file:
+            fps = 0.0
+            if cv2 is not None:
+                try:
+                    fps = capture.get(cv2.CAP_PROP_FPS)
+                except Exception:
+                    pass
+            if not fps or fps <= 0:
+                fps = getattr(self.camera_settings, "target_fps", 25.0) or 25.0
+            frame_delay = 1.0 / fps
+
         while not self._stop_event.is_set():
+            start_time = time.monotonic()
             try:
                 ok, frame = capture.read()
             except Exception as exc:  # noqa: BLE001 - se sanitiza antes de estado/log.
@@ -278,7 +311,31 @@ class RTSPStream:
             if ok and frame is not None:
                 self._store_frame(frame)
                 last_success = now_monotonic
+                
+                # Apply rate-limiting for local files
+                if self._is_local_file:
+                    elapsed = time.monotonic() - start_time
+                    sleep_time = max(0.0, frame_delay - elapsed)
+                    if sleep_time > 0:
+                        self._stop_event.wait(sleep_time)
                 continue
+
+            # Si es un video local y terminó, revisar si configuramos bucle
+            if self._is_local_file:
+                video_loop = getattr(self.camera_settings, "video_loop", True)
+                if video_loop:
+                    try:
+                        if cv2 is not None:
+                            capture.set(cv2.CAP_PROP_POS_FRAMES, 0)
+                        with self._lock:
+                            self._loop_count += 1
+                            self._frame_sequence = 0  # Trigger de reseteo para el coordinador
+                        logger.info("camera=%s event=video_loop_reset loop=%d", self.camera_settings.camera_id, self._loop_count)
+                        continue
+                    except Exception as exc:
+                        logger.warning("camera=%s event=video_loop_failed error=%s", self.camera_settings.camera_id, self._sanitize_error(exc))
+                else:
+                    return "Fin del video (loop desactivado)"
 
             self._mark_read_failure("read() sin frame")
             if self._consecutive_failures_exceeded():
@@ -316,9 +373,13 @@ class RTSPStream:
         except Exception as exc:  # noqa: BLE001
             self._set_last_error(exc)
 
-    def _default_capture_factory(self, url: str) -> cv2.VideoCapture:
+    def _default_capture_factory(self, url: str | int) -> cv2.VideoCapture:
         if cv2 is None:
             raise RuntimeError("OpenCV no esta instalado; instala opencv-python para usar RTSP")
+        if isinstance(url, int) or self._is_local_file or self._is_webcam:
+            capture = cv2.VideoCapture(url)
+            return capture
+
         self._prepare_ffmpeg_options()
         backend = getattr(cv2, "CAP_FFMPEG", 0)
 

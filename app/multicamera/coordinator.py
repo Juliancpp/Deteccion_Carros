@@ -7,10 +7,12 @@ import time
 import uuid
 from collections import deque
 from datetime import datetime, timezone
+from dataclasses import dataclass
 from typing import Any, Callable
 
 from app import config
 from app.detector import VehicleDetector
+from app.line_detector import VirtualLineDetector, LineCrossing
 from app.multicamera.camera_context import (
     CameraContext,
     CameraCoordinatorStatus,
@@ -18,10 +20,58 @@ from app.multicamera.camera_context import (
     MultiCameraStatus,
 )
 from app.multicamera.event_candidate import EventCandidate
-from app.passage.corridor_detector import PassageCorridorDetector
+from app.passage.corridor_detector import PassageCorridorDetector, PassageConfirmation
 from app.settings import CameraSettings, DVRSettings
 from app.tracker import VehicleTracker
 from app.video.rtsp_stream import RTSPStream
+
+
+@dataclass(frozen=True)
+class NormalizedCrossing:
+    track_id: int
+    direction: str
+    track_point: tuple[int, int]
+    occurred_at: datetime
+    corridor_progress: float | None = None
+    lateral_distance: float | None = None
+
+
+def _normalize_crossing(crossing: Any) -> NormalizedCrossing:
+    if isinstance(crossing, PassageConfirmation):
+        return NormalizedCrossing(
+            track_id=crossing.track_id,
+            direction=crossing.direction,
+            track_point=crossing.track_point,
+            occurred_at=crossing.confirmed_at,
+            corridor_progress=crossing.progress,
+            lateral_distance=crossing.lateral_distance,
+        )
+    if isinstance(crossing, LineCrossing):
+        return NormalizedCrossing(
+            track_id=crossing.track_id,
+            direction=crossing.direction,
+            track_point=crossing.center,
+            occurred_at=crossing.crossed_at,
+            corridor_progress=None,
+            lateral_distance=None,
+        )
+    # Generic duck typing for mocks in tests
+    track_id = int(getattr(crossing, "track_id"))
+    direction = str(getattr(crossing, "direction"))
+    occurred_at = getattr(crossing, "confirmed_at", None) or getattr(crossing, "crossed_at", None)
+    if occurred_at is None:
+        occurred_at = datetime.now(timezone.utc)
+    track_point = getattr(crossing, "track_point", None) or getattr(crossing, "center", (0, 0))
+    progress = getattr(crossing, "progress", None)
+    lateral_distance = getattr(crossing, "lateral_distance", None)
+    return NormalizedCrossing(
+        track_id=track_id,
+        direction=direction,
+        track_point=track_point,
+        occurred_at=occurred_at,
+        corridor_progress=progress,
+        lateral_distance=lateral_distance,
+    )
 
 
 logger = logging.getLogger(__name__)
@@ -161,6 +211,7 @@ class MultiCameraCoordinator:
                     detections_count=result.detections_count,
                     tracked_vehicles=result.tracked_vehicles,
                     annotated_frame=result.annotated_frame.copy(),
+                    raw_frame=result.raw_frame.copy() if result.raw_frame is not None else None,
                 )
             return result
 
@@ -263,6 +314,7 @@ class MultiCameraCoordinator:
             detections_count=len(detections),
             tracked_vehicles=tuple(dict(vehicle) for vehicle in tracked),
             annotated_frame=annotated.copy() if self.copy_result_frame else None,
+            raw_frame=frame.copy() if self.copy_result_frame else None,
         )
 
         with self._lock:
@@ -286,13 +338,14 @@ class MultiCameraCoordinator:
             self._prune_window(self._inference_times, time.monotonic())
         return True
 
-    def _process_passage_confirmations(self, context: CameraContext, tracked: list[dict], frame, latest) -> list[Any]:
+    def _process_passage_confirmations(self, context: CameraContext, tracked: list[dict], frame, latest) -> list[NormalizedCrossing]:
         if context.line_detector is None:
             return []
         frame_height, frame_width = frame.shape[:2]
-        confirmations: list[Any] = []
+        normalized_crossings: list[NormalizedCrossing] = []
         try:
-            if hasattr(context.line_detector, "points_for_frame"):
+            detector_cls_name = type(context.line_detector).__name__
+            if detector_cls_name == "PassageCorridorDetector" or hasattr(context.line_detector, "points_for_frame"):
                 for vehicle in tracked:
                     if vehicle.get("id") is None:
                         continue
@@ -304,27 +357,29 @@ class MultiCameraCoordinator:
                         captured_at=latest.captured_at,
                     )
                     if confirmation is not None:
-                        confirmations.append(confirmation)
+                        normalized_crossings.append(_normalize_crossing(confirmation))
             else:
-                confirmations = context.line_detector.update(
+                crossings = context.line_detector.update(
                     tracked_objects=tracked,
                     frame_width=frame_width,
                     frame_height=frame_height,
                     captured_at=latest.captured_at,
                     frame_sequence=latest.sequence,
                 )
+                for crossing in crossings:
+                    normalized_crossings.append(_normalize_crossing(crossing))
         except Exception as exc:  # noqa: BLE001
-            context.last_error = f"corredor: {type(exc).__name__}"
-            logger.exception("camera=%s event=passage_error", context.camera_id)
+            context.last_error = f"detector: {type(exc).__name__}"
+            logger.exception("camera=%s event=detector_error", context.camera_id)
             return []
 
-        for confirmation in confirmations:
-            vehicle = _vehicle_by_track_id(tracked, confirmation.track_id)
+        for normalized in normalized_crossings:
+            vehicle = _vehicle_by_track_id(tracked, normalized.track_id)
             if vehicle is None:
                 continue
             event = self._event_from_confirmation(
                 context,
-                confirmation,
+                normalized,
                 vehicle,
                 frame,
                 latest.sequence,
@@ -332,12 +387,12 @@ class MultiCameraCoordinator:
                 frame_height,
             )
             self._publish_event(context, event)
-        return confirmations
+        return normalized_crossings
 
     def _event_from_confirmation(
         self,
         context: CameraContext,
-        confirmation,
+        confirmation: NormalizedCrossing,
         vehicle: dict,
         frame,
         source_sequence: int,
@@ -350,20 +405,20 @@ class MultiCameraCoordinator:
             event_id=str(uuid.uuid4()),
             camera_id=context.camera_id,
             camera_name=context.camera_name,
-            track_id=int(confirmation.track_id),
-            direction=str(confirmation.direction),
-            occurred_at=confirmation.confirmed_at,
+            track_id=confirmation.track_id,
+            direction=confirmation.direction,
+            occurred_at=confirmation.occurred_at,
             source_sequence=int(source_sequence),
             class_name=str(vehicle.get("class", "Desconocido")),
             class_id=int(vehicle.get("class_id", -1)),
             confidence=float(vehicle.get("confidence", 0.0)),
             bbox=(x1, y1, x2, y2),
-            center=tuple(confirmation.track_point),
+            center=confirmation.track_point,
             frame_width=frame_width,
             frame_height=frame_height,
             frame=frame_copy,
-            track_point=tuple(confirmation.track_point),
-            corridor_progress=float(confirmation.progress),
+            track_point=confirmation.track_point,
+            corridor_progress=confirmation.corridor_progress,
         )
 
     def _publish_event(self, context: CameraContext, event: EventCandidate) -> None:
@@ -387,11 +442,25 @@ class MultiCameraCoordinator:
             and (not context.last_stream_connected or stream_status.reconnect_count != context.last_reconnect_count)
         )
         sequence_reset = stream_status.frame_sequence < context.last_consumed_sequence
-        if reconnected or sequence_reset:
+        
+        loop_reset = False
+        loop_count = getattr(stream_status, "loop_count", 0)
+        if not hasattr(context, "last_loop_count"):
+            context.last_loop_count = 0
+        if loop_count != context.last_loop_count:
+            loop_reset = True
+            context.last_loop_count = loop_count
+
+        if reconnected or sequence_reset or loop_reset:
             context.tracker.reset()
             if context.line_detector is not None:
                 context.line_detector.reset()
             context.last_consumed_sequence = 0
+            context.active_track_ids.clear()
+            context.skipped_frames = 0
+            context.processed_sequence = 0
+            context.source_sequence = 0
+
         context.last_stream_connected = stream_status.connected
         context.last_reconnect_count = stream_status.reconnect_count
 
@@ -529,7 +598,17 @@ def _active_ids(tracker: Any, tracked: list[dict]) -> list[int]:
     return sorted(vehicle["id"] for vehicle in tracked if vehicle.get("id") is not None)
 
 
-def _passage_detector_from_camera(camera: CameraSettings) -> PassageCorridorDetector:
+def _passage_detector_from_camera(camera: CameraSettings) -> Any:
+    # Si la línea virtual está habilitada, usar VirtualLineDetector
+    if getattr(camera, "line", None) is not None and camera.line.enabled:
+        return VirtualLineDetector(
+            normalized_start=(camera.line.start_x, camera.line.start_y),
+            normalized_end=(camera.line.end_x, camera.line.end_y),
+            event_directions=camera.line.event_directions,
+            line_enabled=camera.line.enabled,
+            invert_direction=camera.line.invert_direction,
+        )
+
     passage = camera.passage
     if passage is None:
         points = ((0.27, 0.98), (0.43, 0.83), (0.59, 0.69), (0.70, 0.58))
@@ -571,4 +650,6 @@ def _vehicle_by_track_id(tracked: list[dict], track_id: int) -> dict | None:
 def _line_metric(line_detector: Any, metric: str) -> int:
     if line_detector is None:
         return 0
+    if metric == "confirmed_count" and hasattr(line_detector, "crossing_candidates_count"):
+        return int(getattr(line_detector, "crossing_candidates_count", 0))
     return int(getattr(line_detector, metric, 0))

@@ -1,26 +1,46 @@
-#!/usr/bin/env python3
-from __future__ import annotations
-
+#!/usr/bin/env python
+import argparse
 import sys
-from pathlib import Path
+import os
 
-PROJECT_ROOT = Path(__file__).resolve().parent.parent
-sys.path.insert(0, str(PROJECT_ROOT))
+# Asegurar que el directorio raíz del proyecto esté en el path
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
-from app import config
 from app.export.excel_exporter import HotelExcelExporter
 from app.hotel.store import HotelStore
+import app.config as config
 
 
-def main() -> int:
-    store = HotelStore(config.HOTEL_DATABASE_PATH)
+def main():
+    parser = argparse.ArgumentParser(description="Exportar base de datos Hotel MVP a Excel")
+    parser.add_argument(
+        "--db-path",
+        default=getattr(config, "HOTEL_DATABASE_PATH", "database/hotel_mvp.db"),
+        help="Ruta al archivo SQLite de hotel",
+    )
+    parser.add_argument(
+        "--output",
+        default="data/reportes/control_vehiculos.xlsx",
+        help="Ruta de salida para el reporte Excel",
+    )
+    args = parser.parse_args()
+
+    if not os.path.exists(args.db_path):
+        print(f"Error: La base de datos no existe en: {args.db_path}")
+        sys.exit(1)
+
+    print(f"Exportando {args.db_path} a {args.output}...")
+    store = HotelStore(args.db_path)
     try:
-        path = HotelExcelExporter(store, config.HOTEL_REPORT_PATH).export()
-        print(f"[EXCEL] Exportado: {path}")
-        return 0
+        exporter = HotelExcelExporter(store, args.output)
+        exporter.export()
+        print("Exportación completada exitosamente.")
+    except Exception as e:
+        print(f"Fallo en exportación: {e}")
+        sys.exit(1)
     finally:
         store.close()
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    main()

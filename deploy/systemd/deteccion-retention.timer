@@ -1,0 +1,9 @@
+[Unit]
+Description=Temporizador Diario para Purga de Evidencias - Hotel MVP
+
+[Timer]
+OnCalendar=*-*-* 03:00:00
+Persistent=true
+
+[Install]
+WantedBy=timers.target

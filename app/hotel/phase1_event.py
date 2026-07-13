@@ -25,6 +25,14 @@ class HotelTrackResult:
     evidence_frame: Any | None
     reason: str
     finalized: bool
+    logical_id: int | None = None
+    original_track_ids: tuple[int, ...] = ()
+    room_score_breakdown: dict[str, float] | None = None
+    room_runner_up: int | None = None
+    room_vote_margin: float = 0.0
+    passed_in_front_only: bool = False
+    review_reasons: tuple[str, ...] = ()
+
 
 
 def new_result_id() -> str:

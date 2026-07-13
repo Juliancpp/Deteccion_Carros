@@ -11,7 +11,10 @@ from typing import Optional
 import cv2
 import numpy as np
 
-from config import CAPTURE_DIR, CAPTURE_ENABLED, PADDING_CAPTURE
+try:
+    from app.config import CAPTURE_DIR, CAPTURE_ENABLED, PADDING_CAPTURE
+except ImportError:
+    from config import CAPTURE_DIR, CAPTURE_ENABLED, PADDING_CAPTURE  # type: ignore
 
 
 class EvidenceCapture:

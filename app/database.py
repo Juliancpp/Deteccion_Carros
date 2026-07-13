@@ -11,7 +11,10 @@ from typing import List
 from sqlalchemy import Column, DateTime, Float, Integer, String, create_engine, select
 from sqlalchemy.orm import declarative_base, sessionmaker
 
-from config import CAMERA_ID, DATABASE_PATH
+try:
+    from app.config import CAMERA_ID, DATABASE_PATH
+except ImportError:
+    from config import CAMERA_ID, DATABASE_PATH  # type: ignore
 
 
 Base = declarative_base()
@@ -40,9 +43,18 @@ class DatabaseManager:
         self.camera_id = str(camera_id)
         os.makedirs(os.path.dirname(self.db_path), exist_ok=True)
 
-        self.engine = create_engine(f"sqlite:///{self.db_path}", future=True)
+        self.engine = create_engine(
+            f"sqlite:///{self.db_path}",
+            connect_args={"timeout": 30},
+            future=True
+        )
         self.Session = sessionmaker(bind=self.engine, future=True)
         Base.metadata.create_all(self.engine)
+
+        # Habilitar modo WAL y configuraciones de sincronización optimizadas para SQLite multihilo
+        with self.engine.connect() as conn:
+            conn.exec_driver_sql("PRAGMA journal_mode=WAL")
+            conn.exec_driver_sql("PRAGMA synchronous=NORMAL")
 
     def save_event(self, event: dict) -> int:
         """

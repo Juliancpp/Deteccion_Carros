@@ -1,23 +1,22 @@
-# Entorno virtual
-venv/
-
-# Configuracion local sensible
-.env
-
-# Python
-__pycache__/
-*.pyc
-*.pyo
-*.egg-info/
-
 # Modelos descargados (pesados)
 /yolo11n.pt
 models/*.pt
 models/*.onnx
 
+# Entorno local
+venv/
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+
+# Credenciales locales
+.env
+.env.*
+!.env.example
+
 # Capturas (generadas en runtime)
-data/captures/*.jpg
-data/captures/*.png
+data/captures/
 data/rtsp_test/*.jpg
 data/multicamera_test/*.jpg
 data/line_calibration/*.jpg
@@ -27,11 +26,15 @@ data/hotel_events/
 data/hotel_calibration/*.jpg
 data/hotel_phase1_calibration/*.jpg
 data/hotel_phase1_test/*.jpg
+data/runtime/
 data/reportes/*.xlsx
 *.mkv
+*.mp4
 
 # Base de datos
 database/*.db
+database/*.db-shm
+database/*.db-wal
 
 # Logs
 *.log
@@ -46,3 +49,9 @@ Thumbs.db
 
 # Ultralytics cache
 runs/
+
+# Validation dataset
+data/validation/
+
+# Backups locales generados durante hotfixes
+*.bak

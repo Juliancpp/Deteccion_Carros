@@ -93,6 +93,9 @@ class CameraSettings:
     passage: CameraPassageSettings | None = None
     gate: CameraGateSettings | None = None
     rooms: tuple[RoomZoneSettings, ...] = ()
+    video_path: str | None = None
+    video_loop: bool = True
+
 
 
 @dataclass(frozen=True)
@@ -123,12 +126,48 @@ def load_settings(
     else:
         source = environ
 
-    dvr = DVRSettings(
-        host=_required_str(source, "DVR_HOST"),
-        rtsp_port=_required_int(source, "DVR_RTSP_PORT", min_value=1, max_value=65535),
-        username=_required_str(source, "DVR_USERNAME"),
-        password=_required_secret(source, "DVR_PASSWORD"),
-    )
+    # Determinar si se requiere DVR real (si hay alguna camara habilitada que no sea local/video_path)
+    any_enabled = False
+    all_local = True
+    for prefix in CAMERA_PREFIXES:
+        enabled_key = f"{prefix}_ENABLED"
+        enabled = False
+        if enabled_key in source:
+            try:
+                enabled = _required_bool(source, enabled_key)
+            except SettingsError:
+                pass
+        if enabled:
+            any_enabled = True
+            video_path_key = f"{prefix}_VIDEO_PATH"
+            if video_path_key not in source or not source[video_path_key].strip():
+                all_local = False
+
+    dvr_required = any_enabled and not all_local
+
+    if dvr_required:
+        dvr = DVRSettings(
+            host=_required_str(source, "DVR_HOST"),
+            rtsp_port=_required_int(source, "DVR_RTSP_PORT", min_value=1, max_value=65535),
+            username=_required_str(source, "DVR_USERNAME"),
+            password=_required_secret(source, "DVR_PASSWORD"),
+        )
+    else:
+        host = source.get("DVR_HOST", "localhost").strip() or "localhost"
+        port_raw = source.get("DVR_RTSP_PORT", "554").strip() or "554"
+        try:
+            port = int(port_raw)
+        except ValueError:
+            port = 554
+        username = source.get("DVR_USERNAME", "dummy").strip() or "dummy"
+        password = source.get("DVR_PASSWORD", "dummy").strip() or "dummy"
+        
+        dvr = DVRSettings(
+            host=host,
+            rtsp_port=port,
+            username=username,
+            password=password,
+        )
 
     cameras = [_load_camera(source, prefix) for prefix in CAMERA_PREFIXES]
     _validate_unique_camera_ids(cameras)
@@ -192,6 +231,9 @@ def sanitize_sensitive_text(
 
 
 def _load_camera(source: Mapping[str, str], prefix: str) -> CameraSettings:
+    loop_val = str(source.get(f"{prefix}_VIDEO_LOOP", "true")).strip().lower()
+    video_loop = loop_val not in {"false", "0"}
+    
     return CameraSettings(
         camera_id=_required_str(source, f"{prefix}_ID"),
         name=_required_str(source, f"{prefix}_NAME"),
@@ -203,6 +245,8 @@ def _load_camera(source: Mapping[str, str], prefix: str) -> CameraSettings:
         passage=_load_camera_passage(source, prefix),
         gate=_load_camera_gate(source, prefix),
         rooms=_load_room_zones(source, prefix),
+        video_path=source.get(f"{prefix}_VIDEO_PATH", "").strip() or None,
+        video_loop=video_loop,
     )
 
 

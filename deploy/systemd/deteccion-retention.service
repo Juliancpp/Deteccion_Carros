@@ -1,0 +1,9 @@
+[Unit]
+Description=Purga de Evidencias y Clips Viejos - Hotel MVP
+After=network.target
+
+[Service]
+Type=oneshot
+User=REPLACE_USER
+WorkingDirectory=REPLACE_WORKING_DIR
+ExecStart=REPLACE_WORKING_DIR/venv/bin/python scripts/cleanup_old_media.py
