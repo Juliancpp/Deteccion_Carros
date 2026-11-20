@@ -23,6 +23,7 @@ python-dotenv>=1.0.0
 
 # Dependencias usadas por las fases actuales.
 fastapi
+argon2-cffi>=23.1.0
 uvicorn
 matplotlib
 pillow

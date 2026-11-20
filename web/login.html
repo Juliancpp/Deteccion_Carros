@@ -59,7 +59,6 @@
         });
         const data = await res.json().catch(() => ({}));
         if (!res.ok) throw new Error(data.detail || "No se pudo iniciar sesión.");
-        sessionStorage.setItem("csrfToken", data.csrf_token || "");
         window.location.href = "/";
       } catch (err) {
         errorBox.textContent = err.message;

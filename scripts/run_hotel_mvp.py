@@ -15,6 +15,12 @@ import threading
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
+# Legacy CPU: disable unsupported NNPACK backend
+import torch
+
+if hasattr(torch.backends, "nnpack") and hasattr(torch.backends.nnpack, "set_flags"):
+    torch.backends.nnpack.set_flags(False)
+
 from app.hotel.phase1_analyzer import HotelPhase1Analyzer
 from app.hotel.frame_buffer import TrackFrameBuffer
 from app.multicamera.coordinator import MultiCameraCoordinator
@@ -281,7 +287,7 @@ def _write_status_json(status_file: str, coordinator, analyzers, consumer, clip_
         if latest_runs:
             last_run = latest_runs[-1]
             last_event_type = last_run.movement
-            last_plate = last_run.plate
+            last_plate = getattr(last_run, "plate", None)
             last_room = last_run.room_number
 
         camera_data[cam.camera_id] = {

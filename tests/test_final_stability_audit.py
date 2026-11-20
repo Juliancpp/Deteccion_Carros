@@ -125,75 +125,36 @@ def test_snapshot_endpoint_responses(monkeypatch, tmp_path):
     assert traversal.value.status_code == 400
 
 
-def test_login_logout_cookie_and_csrf(monkeypatch):
+def test_login_logout_cookie_and_csrf(monkeypatch, tmp_path):
     import app.api as api
-
-    monkeypatch.setenv("DASHBOARD_AUTH_ENABLED", "true")
-    monkeypatch.setenv("DASHBOARD_USERNAME", "admin")
-    monkeypatch.setenv("DASHBOARD_PASSWORD", "secret-pass")
-    monkeypatch.setenv("DASHBOARD_SESSION_SECRET", "long-test-secret-value")
-    monkeypatch.setenv("DASHBOARD_LOGIN_MAX_ATTEMPTS", "5")
-    api._login_failures.clear()
-    response = Response()
-    csrf = api._set_session_cookie(response, "admin", None)
-    set_cookie = "\n".join(response.headers.getlist("set-cookie")).lower()
-    assert "httponly" in set_cookie
-    assert "samesite=lax" in set_cookie
-    assert "secure" not in set_cookie
-    secure_response = Response()
-
-    class HttpsRequest:
-        headers = {"X-Forwarded-Proto": "https"}
-
-    api._set_session_cookie(secure_response, "admin", HttpsRequest())
-    assert "secure" in "\n".join(secure_response.headers.getlist("set-cookie")).lower()
-    token = response.headers.getlist("set-cookie")[0].split("=", 1)[1].split(";", 1)[0]
-    assert api._verify_session(token) == "admin"
-
-    class Client:
-        host = "testclient"
-
-    class Request:
-        method = "POST"
-        client = Client()
-        cookies = {api.SESSION_COOKIE: token, api.CSRF_COOKIE: csrf}
-        headers = {}
-
-    with pytest.raises(HTTPException) as blocked:
-        api.check_auth(Request(), credentials=None)
-    assert blocked.value.status_code == 403
-
-    Request.headers = {"X-CSRF-Token": csrf}
-    assert api.check_auth(Request(), credentials=None) is True
+    from fastapi.testclient import TestClient
+    monkeypatch.setattr(api.config, "HOTEL_DATABASE_PATH", str(tmp_path / "auth.db"))
+    monkeypatch.setenv("DASHBOARD_COOKIE_SECURE", "false")
+    monkeypatch.delenv("DASHBOARD_ENV", raising=False)
+    with TestClient(api.app) as client:
+        api.admin.create_user("admin", "long-test-password", "admin")
+        result = client.post("/api/auth/login", json={"username":"admin","password":"long-test-password"})
+        assert result.status_code == 200
+        assert "HttpOnly" in result.headers["set-cookie"]
+        assert "SameSite=lax" in result.headers["set-cookie"]
+        assert client.post("/api/auth/logout").status_code == 403
+        client.headers["X-CSRF-Token"] = result.json()["csrf_token"]
+        assert client.post("/api/auth/logout").status_code == 200
+        assert client.get("/api/auth/me").status_code == 401
 
 
-def test_login_lockout(monkeypatch):
+def test_login_lockout(monkeypatch, tmp_path):
     import app.api as api
-
-    monkeypatch.setenv("DASHBOARD_AUTH_ENABLED", "true")
-    monkeypatch.setenv("DASHBOARD_USERNAME", "admin")
-    monkeypatch.setenv("DASHBOARD_PASSWORD", "secret-pass")
-    monkeypatch.setenv("DASHBOARD_SESSION_SECRET", "long-test-secret-value")
+    from fastapi.testclient import TestClient
+    monkeypatch.setattr(api.config, "HOTEL_DATABASE_PATH", str(tmp_path / "auth.db"))
     monkeypatch.setenv("DASHBOARD_LOGIN_MAX_ATTEMPTS", "2")
     monkeypatch.setenv("DASHBOARD_LOGIN_LOCK_SECONDS", "300")
     api._login_failures.clear()
-
-    class Client:
-        host = "lockout-client"
-
-    class Request:
-        client = Client()
-
-        async def json(self):
-            return {"username": "admin", "password": "bad"}
-
-    async def run_attempts():
-        first = await api.login(Request(), Response())
-        second = await api.login(Request(), Response())
-        third = await api.login(Request(), Response())
-        return first.status_code, second.status_code, third.status_code
-
-    assert asyncio.run(run_attempts()) == (401, 401, 429)
+    with TestClient(api.app) as client:
+        codes = [client.post("/api/auth/login", json={"username":"admin","password":"bad"}).status_code
+                 for _ in range(3)]
+        assert codes == [401, 401, 429]
+    api._login_failures.clear()
 
 
 def test_consumer_handles_100_mock_events_with_periodic_failures(tmp_path):

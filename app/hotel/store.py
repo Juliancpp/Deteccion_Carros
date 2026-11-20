@@ -51,7 +51,9 @@ class HotelStore:
                 reviewed_at TEXT,
                 reviewed_by TEXT,
                 corrected_at TEXT,
-                correction_notes TEXT
+                correction_notes TEXT,
+                source TEXT NOT NULL DEFAULT 'mvp_hotel',
+                source_event_id TEXT
             );
 
             CREATE TABLE IF NOT EXISTS hotel_visits (
@@ -115,6 +117,13 @@ class HotelStore:
                 if col_name not in columns:
                     self.conn.execute(f"ALTER TABLE hotel_vehicle_events ADD COLUMN {col_name} {col_def}")
                     self.conn.commit()
+            current = [row["name"] for row in self.conn.execute("PRAGMA table_info(hotel_vehicle_events)").fetchall()]
+            for col_name, col_def in {"source": "TEXT NOT NULL DEFAULT 'mvp_hotel'", "source_event_id": "TEXT"}.items():
+                if col_name not in current:
+                    self.conn.execute(f"ALTER TABLE hotel_vehicle_events ADD COLUMN {col_name} {col_def}")
+            self.conn.execute("UPDATE hotel_vehicle_events SET source='mvp_hotel', source_event_id=event_id WHERE source_event_id IS NULL")
+            self.conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS uq_hotel_event_source ON hotel_vehicle_events(source, source_event_id)")
+            self.conn.commit()
         except Exception:
             pass
 
@@ -148,8 +157,8 @@ class HotelStore:
                 corrected_at, correction_notes, logical_vehicle_id, original_track_ids_json,
                 plate_raw_candidates_json, plate_runner_up, plate_runner_up_confidence,
                 plate_vote_margin, plate_supporting_frames_json, room_score_breakdown_json,
-                room_runner_up, room_vote_margin, review_reasons_json
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                room_runner_up, room_vote_margin, review_reasons_json, source, source_event_id
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 event.event_id,
@@ -190,6 +199,8 @@ class HotelStore:
                 room_runner_up,
                 room_vote_margin,
                 review_reasons_json,
+                "mvp_hotel",
+                event.event_id,
             ),
         )
         self._update_visit(event)

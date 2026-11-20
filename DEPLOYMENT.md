@@ -31,13 +31,21 @@ El script validará:
 
 Edita el archivo `.env` del repositorio para configurar la autenticación del dashboard y otros parámetros:
 ```ini
-DASHBOARD_AUTH_ENABLED=true
-DASHBOARD_USERNAME=admin
-DASHBOARD_PASSWORD=tu_contraseña_segura
+DASHBOARD_ENV=production
+DASHBOARD_COOKIE_SECURE=true
+DASHBOARD_SESSION_HOURS=8
 RETENTION_DAYS=15
 ```
 
 ---
+
+El acceso requiere siempre un usuario activo en SQLite. Crea el primer administrador
+con `venv/bin/python scripts/create_user.py --username julian --role admin`;
+la contraseña se solicita sin mostrarla. Las variables antiguas de usuario,
+contraseña y habilitación de autenticación ya no autorizan acceso.
+En producción sirve el dashboard mediante HTTPS. Para desarrollo HTTP local utiliza
+`DASHBOARD_ENV=development` y `DASHBOARD_COOKIE_SECURE=false`.
+Consulta [ADMINISTRATION.md](ADMINISTRATION.md) para migración, rutas y métricas.
 
 ## 3. Instalación de Servicios Systemd
 

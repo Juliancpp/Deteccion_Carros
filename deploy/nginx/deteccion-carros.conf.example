@@ -8,8 +8,8 @@ server {
     # Servir archivos estáticos del frontend directamente por Nginx (más rápido)
     location /static/ {
         alias REPLACE_WORKING_DIR/web/;
-        expires 1d;
-        add_header Cache-Control "public";
+        expires off;
+        add_header Cache-Control "no-cache, max-age=0, must-revalidate";
     }
 
     # Redireccionar el resto de las peticiones a Uvicorn / Gunicorn

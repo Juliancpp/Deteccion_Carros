@@ -146,6 +146,12 @@ def test_api_endpoints_and_manual_correction(tmp_path):
     config.HOTEL_DATABASE_PATH = str(db_file)
     
     try:
+        from app import administration
+        from app.api import PlatePayload
+        from fastapi import HTTPException
+        administration.migrate()
+        administration.create_user('reviewer', 'test-password-long', 'operator')
+        user = {'id': 1, 'username': 'reviewer', 'role': 'operator'}
         # 1. Test Summary stats
         data = get_hotel_summary(authenticated=True)
         assert data["entradas_hoy"] == 1
@@ -160,29 +166,26 @@ def test_api_endpoints_and_manual_correction(tmp_path):
         event_detail = get_hotel_event_detail("evt-1", authenticated=True)
         assert event_detail["plate"] == "ABC1234"
         
-        # 4. Test PATCH manual correction & audit trails
-        payload = {
-            "plate": "XYZ7890",
-            "room_number": 204,
-            "correction_notes": "Correccion de prueba de integracion"
-        }
-        res = patch_hotel_event("evt-1", payload, authenticated=True)
+        # 4. Corrections preserve original event evidence and record the actual user.
+        res = patch_hotel_event("evt-1", PlatePayload(plate="XYZ7890"), authenticated=user)
         assert res["success"] is True
         
         # Check database update
         updated_evt = get_hotel_event_detail("evt-1", authenticated=True)
         assert updated_evt["plate"] == "XYZ7890"
-        assert updated_evt["room_number"] == 204
+        assert updated_evt["room_number"] == 102
+        assert updated_evt["plate_original"] == "ABC1234"
         
         # Check audit trail logs
-        assert len(updated_evt["audit_logs"]) == 2 # plate and room changed
+        assert len(updated_evt["audit_logs"]) == 1
         audit_fields = [log["field_name"] for log in updated_evt["audit_logs"]]
         assert "plate" in audit_fields
-        assert "room_number" in audit_fields
+        assert updated_evt["audit_logs"][0]["changed_by"] == 'reviewer'
         
         # 5. Test manual rebuild visits
-        res = post_rebuild_visits(authenticated=True)
-        assert res["success"] is True
+        with pytest.raises(HTTPException) as blocked:
+            post_rebuild_visits(authenticated=user)
+        assert blocked.value.status_code == 409
         
     finally:
         store.close()

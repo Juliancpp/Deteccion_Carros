@@ -8,103 +8,65 @@ import os
 import sys
 import hmac
 import json
-import base64
 import hashlib
-import secrets
 import time
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
-from fastapi import FastAPI, Depends, HTTPException, Request, Response, status
-from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
+from fastapi import FastAPI, Depends, HTTPException, Request, Response
+from fastapi.responses import FileResponse, HTMLResponse
 from fastapi.staticfiles import StaticFiles
-from fastapi.security import HTTPBasic, HTTPBasicCredentials
+from dotenv import load_dotenv
 
 # Add project root to path
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
+load_dotenv(PROJECT_ROOT / '.env', override=False)
 
 import app.config as config
 from app.database import DatabaseManager
 from app.hotel.store import HotelStore
 from app.export.excel_exporter import HotelExcelExporter
 from app.runtime import is_valid_jpeg, runtime_snapshot_path, snapshot_info, validate_runtime_camera
+from app import administration as admin
+from contextlib import asynccontextmanager
+from fastapi.responses import RedirectResponse
+from pydantic import BaseModel, Field
 
-app = FastAPI(title="Deteccion_Carros Dashboard", version="1.0.0")
 
-# Security schema for optional Basic Auth
-security = HTTPBasic(auto_error=False)
+@asynccontextmanager
+async def lifespan(app):
+    store = HotelStore(config.HOTEL_DATABASE_PATH)
+    store.close()
+    admin.migrate()
+    yield
+
+
+app = FastAPI(title="Deteccion_Carros Dashboard", version="1.1.0", lifespan=lifespan)
 SESSION_COOKIE = "hotel_relax_session"
 CSRF_COOKIE = "hotel_relax_csrf"
 _login_failures: dict[str, tuple[int, float]] = {}
 
 
-def _auth_enabled() -> bool:
-    return os.getenv("DASHBOARD_AUTH_ENABLED", "false").lower() == "true"
-
-
-def _session_secret() -> str:
-    return os.getenv("DASHBOARD_SESSION_SECRET") or os.getenv("DASHBOARD_PASSWORD", "valor_local")
-
-
-def _sign_session(username: str, expires_at: int) -> str:
-    payload = json.dumps({"u": username, "exp": expires_at}, separators=(",", ":")).encode("utf-8")
-    body = base64.urlsafe_b64encode(payload).decode("ascii")
-    sig = hmac.new(_session_secret().encode("utf-8"), body.encode("ascii"), hashlib.sha256).hexdigest()
-    return f"{body}.{sig}"
-
-
-def _verify_session(token: str | None) -> str | None:
-    if not token or "." not in token:
-        return None
-    body, sig = token.rsplit(".", 1)
-    expected = hmac.new(_session_secret().encode("utf-8"), body.encode("ascii"), hashlib.sha256).hexdigest()
-    if not hmac.compare_digest(sig, expected):
-        return None
-    try:
-        payload = json.loads(base64.urlsafe_b64decode(body.encode("ascii")))
-    except Exception:
-        return None
-    if int(payload.get("exp", 0)) < int(time.time()):
-        return None
-    return str(payload.get("u") or "")
-
-
 def _cookie_secure(request: Request | None = None) -> bool:
-    mode = os.getenv("DASHBOARD_COOKIE_SECURE", "auto").lower()
-    if mode == "true":
+    if os.getenv("DASHBOARD_ENV", "").lower() == "production":
         return True
-    if mode == "false":
-        return False
-    forwarded_proto = request.headers.get("X-Forwarded-Proto", "") if request else ""
-    return forwarded_proto.lower() == "https"
+    mode = os.getenv("DASHBOARD_COOKIE_SECURE", "auto").lower()
+    if mode in {"true", "false"}:
+        return mode == "true"
+    return bool(request and request.url.scheme == "https")
 
 
-def _set_session_cookie(response: Response, username: str, request: Request | None = None) -> str:
-    hours = float(os.getenv("DASHBOARD_SESSION_HOURS", "8"))
-    max_age = int(hours * 3600)
-    token = _sign_session(username, int(time.time()) + max_age)
-    csrf = secrets.token_urlsafe(24)
-    response.set_cookie(
-        SESSION_COOKIE,
-        token,
-        max_age=max_age,
-        httponly=True,
-        secure=_cookie_secure(request),
-        samesite="lax",
-        path="/",
-    )
-    response.set_cookie(
-        CSRF_COOKIE,
-        csrf,
-        max_age=max_age,
-        httponly=False,
-        secure=_cookie_secure(request),
-        samesite="lax",
-        path="/",
-    )
+def _set_session_cookie(response: Response, user_id: int, request: Request | None = None) -> str:
+    max_age = max(300, min(int(float(os.getenv("DASHBOARD_SESSION_HOURS", "8")) * 3600), 86400))
+    token, csrf = admin.new_session(user_id, max_age)
+    response.set_cookie(SESSION_COOKIE, token, max_age=max_age, httponly=True,
+                        secure=_cookie_secure(request), samesite="lax", path="/")
+    response.set_cookie(CSRF_COOKIE, csrf, max_age=max_age, httponly=False,
+                        secure=_cookie_secure(request), samesite="lax", path="/")
+    response.headers["Cache-Control"] = "no-store"
     return csrf
 
 
@@ -117,36 +79,29 @@ def _client_key(request: Request) -> str:
     return request.client.host if request.client else "local"
 
 
-def check_auth(request: Request, credentials: HTTPBasicCredentials | None = Depends(security)) -> bool:
-    """Verifies credentials if DASHBOARD_AUTH_ENABLED is set to true."""
-    if not _auth_enabled():
-        return True
+def check_auth(request: Request) -> dict:
+    user = admin.session(request.cookies.get(SESSION_COOKIE))
+    if not user:
+        raise HTTPException(status_code=401, detail="Sesión requerida.")
+    if request.method not in {"GET", "HEAD", "OPTIONS"}:
+        token = request.headers.get("X-CSRF-Token", "")
+        if not hmac.compare_digest(token.encode(), user["csrf_token"].encode()):
+            raise HTTPException(status_code=403, detail="CSRF token inválido.")
+    return {k: user[k] for k in ("id", "username", "role")}
 
-    username = _verify_session(request.cookies.get(SESSION_COOKIE))
-    if username:
-        if request.method in {"POST", "PATCH", "DELETE"}:
-            csrf_cookie = request.cookies.get(CSRF_COOKIE)
-            csrf_header = request.headers.get("X-CSRF-Token")
-            if not csrf_cookie or not csrf_header or not hmac.compare_digest(csrf_cookie, csrf_header):
-                raise HTTPException(status_code=403, detail="CSRF token inválido.")
-        return True
 
-    if credentials is None:
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Sesión requerida.")
-
-    expected_username = os.getenv("DASHBOARD_USERNAME", "admin")
-    expected_password = os.getenv("DASHBOARD_PASSWORD", "valor_local")
-
-    is_username_correct = hmac.compare_digest(credentials.username.encode("utf-8"), expected_username.encode("utf-8"))
-    is_password_correct = hmac.compare_digest(credentials.password.encode("utf-8"), expected_password.encode("utf-8"))
-
-    if not (is_username_correct and is_password_correct):
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Credenciales incorrectas.",
-            headers={"WWW-Authenticate": "Basic"},
-        )
-    return True
+@app.middleware("http")
+async def private_responses(request, call_next):
+    if request.url.path == '/static/index.html':
+        return RedirectResponse('/', status_code=303)
+    response = await call_next(request)
+    if request.url.path.startswith(("/api/", "/media/", "/downloads/")) or request.url.path in {"/", "/login"}:
+        response.headers["Cache-Control"] = "no-store"
+    elif request.url.path.startswith('/static/'):
+        response.headers['Cache-Control'] = 'no-cache, max-age=0, must-revalidate'
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    response.headers["X-Frame-Options"] = "DENY"
+    return response
 
 
 # Initialize DB managers
@@ -157,63 +112,66 @@ WEB_DIR = Path(config.BASE_DIR) / "web"
 app.mount("/static", StaticFiles(directory=str(WEB_DIR)), name="static")
 
 
+def web_page(filename: str):
+    """Bind each HTML response to the exact asset contents, including through proxies."""
+    html = (WEB_DIR / filename).read_text(encoding='utf-8')
+    for asset in ('app.js', 'style.css'):
+        version = hashlib.sha256((WEB_DIR / asset).read_bytes()).hexdigest()[:16]
+        html = html.replace(f'/static/{asset}"', f'/static/{asset}?v={version}"')
+    return HTMLResponse(html)
+
+
 @app.get("/")
-def dashboard(request: Request, authenticated: bool = Depends(check_auth)):
+def dashboard(request: Request):
     """Sirve el dashboard web."""
-    return FileResponse(WEB_DIR / "index.html")
+    if not admin.session(request.cookies.get(SESSION_COOKIE)):
+        return RedirectResponse('/login', status_code=303)
+    return web_page('index.html')
 
 
 @app.get("/login", response_class=HTMLResponse)
 def login_page():
-    return FileResponse(WEB_DIR / "login.html")
+    return web_page('login.html')
+
+
+class LoginPayload(BaseModel):
+    username: str = Field(min_length=1, max_length=100)
+    password: str = Field(min_length=1, max_length=1024)
 
 
 @app.post("/api/auth/login")
-async def login(request: Request, response: Response):
-    if not _auth_enabled():
-        csrf = _set_session_cookie(response, os.getenv("DASHBOARD_USERNAME", "admin"), request)
-        return {"ok": True, "username": os.getenv("DASHBOARD_USERNAME", "admin"), "csrf_token": csrf}
+def login(request: Request, response: Response, payload: LoginPayload):
     key = _client_key(request)
     attempts, locked_until = _login_failures.get(key, (0, 0.0))
-    now = time.time()
-    if locked_until > now:
-        return JSONResponse(status_code=429, content={"detail": "Bloqueo temporal activo.", "retry_after_seconds": int(locked_until - now)})
-    try:
-        data = await request.json()
-    except Exception:
-        return JSONResponse(status_code=400, content={"detail": "JSON inválido."})
-    username = str(data.get("username", ""))
-    password = str(data.get("password", ""))
-    expected_username = os.getenv("DASHBOARD_USERNAME", "admin")
-    expected_password = os.getenv("DASHBOARD_PASSWORD", "valor_local")
-    ok = hmac.compare_digest(username.encode("utf-8"), expected_username.encode("utf-8")) and hmac.compare_digest(
-        password.encode("utf-8"), expected_password.encode("utf-8")
-    )
-    if not ok:
-        max_attempts = int(os.getenv("DASHBOARD_LOGIN_MAX_ATTEMPTS", "5"))
-        lock_seconds = int(os.getenv("DASHBOARD_LOGIN_LOCK_SECONDS", "300"))
+    current = time.time()
+    if locked_until > current:
+        raise HTTPException(429, "Bloqueo temporal activo.")
+    if locked_until:
+        attempts = 0
+    user = admin.authenticate(payload.username.strip(), payload.password)
+    if not user:
         attempts += 1
-        _login_failures[key] = (attempts, now + lock_seconds if attempts >= max_attempts else 0.0)
-        return JSONResponse(status_code=401, content={"detail": "Credenciales incorrectas."})
+        limit = int(os.getenv("DASHBOARD_LOGIN_MAX_ATTEMPTS", "5"))
+        seconds = int(os.getenv("DASHBOARD_LOGIN_LOCK_SECONDS", "300"))
+        _login_failures[key] = (attempts, current + seconds if attempts >= limit else 0)
+        raise HTTPException(401, "Credenciales incorrectas.")
     _login_failures.pop(key, None)
-    csrf = _set_session_cookie(response, username, request)
-    return {"ok": True, "username": username, "csrf_token": csrf}
+    admin.revoke(request.cookies.get(SESSION_COOKIE))
+    csrf = _set_session_cookie(response, user["id"], request)
+    return {"ok": True, "authenticated": True, "username": user["username"], "user": user, "csrf_token": csrf}
 
 
 @app.post("/api/auth/logout")
-def logout(response: Response, authenticated: bool = Depends(check_auth)):
+def logout(request: Request, response: Response, authenticated: dict = Depends(check_auth)):
+    admin.revoke(request.cookies.get(SESSION_COOKIE))
     _clear_session_cookie(response)
     return {"ok": True}
 
 
 @app.get("/api/auth/me")
-def auth_me(request: Request):
-    if not _auth_enabled():
-        return {"authenticated": True, "username": os.getenv("DASHBOARD_USERNAME", "admin"), "csrf_token": request.cookies.get(CSRF_COOKIE)}
-    username = _verify_session(request.cookies.get(SESSION_COOKIE))
-    if not username:
-        return JSONResponse(status_code=401, content={"authenticated": False})
-    return {"authenticated": True, "username": username, "csrf_token": request.cookies.get(CSRF_COOKIE)}
+def auth_me(request: Request, authenticated: dict = Depends(check_auth)):
+    user = admin.session(request.cookies.get(SESSION_COOKIE))
+    return {"authenticated": True, "user": authenticated, "username": authenticated["username"], "csrf_token": user["csrf_token"]}
 
 
 @app.get("/api/health")
@@ -289,11 +247,13 @@ def _image_url(image_path: str) -> str:
 # ─── Hotel MVP Endpoints ─────────────────────────────────────────────
 
 @app.get("/api/hotel/summary")
-def get_hotel_summary(authenticated: bool = Depends(check_auth)):
+def get_hotel_summary(month: Optional[str] = None, authenticated: dict = Depends(check_auth)):
     """Métricas del hotel hoy (entradas, salidas, visitas abiertas, etc.)."""
     store = HotelStore(config.HOTEL_DATABASE_PATH)
     try:
-        return store.get_summary_stats()
+        if month and (len(month) != 7 or month[4] != '-' or not month[:4].isdigit() or not month[5:].isdigit()):
+            raise HTTPException(422, "month debe tener formato YYYY-MM")
+        return {**store.get_summary_stats(), **admin.summary(month=month)}
     finally:
         store.close()
 
@@ -325,92 +285,112 @@ def get_hotel_cameras(authenticated: bool = Depends(check_auth)):
         return {"cameras": {}}
 
 
+def enrich_event(ev):
+    ev["evidence_url"] = _relative_evidence_url(ev.get("evidence_path"))
+    ev["clip_url"] = _relative_clip_url(ev.get("clip_path"))
+    return ev
+
+
+def manual_operation(function, *args):
+    try:
+        return function(*args)
+    except LookupError as exc:
+        raise HTTPException(404, str(exc)) from exc
+    except FileExistsError as exc:
+        raise HTTPException(409, str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(422, str(exc)) from exc
+
+
 @app.get("/api/hotel/events")
 def get_hotel_events(
-    page: int = 1,
-    page_size: int = 25,
-    date_from: Optional[str] = None,
-    date_to: Optional[str] = None,
-    camera: Optional[str] = None,
-    event_type: Optional[str] = None,
-    plate: Optional[str] = None,
-    room: Optional[int] = None,
-    review_required: Optional[bool] = None,
-    plate_status: Optional[str] = None,
-    authenticated: bool = Depends(check_auth)
+    page: int = 1, page_size: int = 25, date_from: Optional[str] = None,
+    date_to: Optional[str] = None, camera: Optional[str] = None,
+    event_type: Optional[str] = None, plate: Optional[str] = None,
+    room: Optional[int] = None, review_required: Optional[bool] = None,
+    plate_status: Optional[str] = None, month: Optional[str] = None,
+    movement: Optional[str] = None, status: Optional[str] = None,
+    authenticated: dict = Depends(check_auth)
 ):
-    """Devuelve listado paginado y filtrado de eventos del hotel."""
-    filters = {
-        "date_from": date_from,
-        "date_to": date_to,
-        "camera": camera,
-        "event_type": event_type,
-        "plate": plate,
-        "room": room,
-        "review_required": review_required,
-        "plate_status": plate_status
-    }
-    store = HotelStore(config.HOTEL_DATABASE_PATH)
-    try:
-        res = store.get_events_filtered(filters, page=page, page_size=page_size)
-        
-        # Enriquecer evidencias y clips con URLs relativas seguras
-        for ev in res["events"]:
-            ev["evidence_url"] = _relative_evidence_url(ev.get("evidence_path"))
-            ev["clip_url"] = _relative_clip_url(ev.get("clip_path"))
-        return res
-    finally:
-        store.close()
+    page, page_size = max(1, page), max(1, min(100, page_size))
+    with admin.connection() as c:
+        rows = admin.events(c)
+    if month:
+        if len(month) != 7 or month[4] != '-' or not month[:4].isdigit() or not month[5:].isdigit():
+            raise HTTPException(422, "month debe tener formato YYYY-MM")
+        year, mon = map(int, month.split('-'))
+        if not 1 <= mon <= 12: raise HTTPException(422, "month inválido")
+        end = f"{year + (mon == 12):04d}-{1 if mon == 12 else mon + 1:02d}-01"
+        # Events are stored as ISO strings, sometimes naive and sometimes offset-aware;
+        # matching the YYYY-MM prefix avoids lexical/timezone edge cases while keeping
+        # the selected calendar month deterministic.
+        rows = [e for e in rows if (e.get("occurred_at") or '').startswith(month)]
+    if date_from:
+        rows = [e for e in rows if e["occurred_at"] >= date_from]
+    if date_to:
+        end = date_to + "T23:59:59.999999" if len(date_to) == 10 else date_to
+        rows = [e for e in rows if e["occurred_at"] <= end]
+    for key, value in (("camera_id", camera), ("event_type", event_type), ("room_number", room),
+                       ("review_required", review_required), ("plate_status", plate_status)):
+        if value is not None and value != '':
+            rows = [e for e in rows if e[key] == value]
+    if movement:
+        rows = [e for e in rows if e.get("movement") == movement.upper()]
+    if status:
+        wanted = status.upper()
+        rows = [e for e in rows if ("COMPLETED" if e.get("visit_id") else "REQUIRES_REVIEW" if e.get("review_required") else "UNPAIRED") == wanted]
+    if plate:
+        term = ''.join(plate.upper().split()).replace('-', '')
+        rows = [e for e in rows if term in (e["plate"] or "").upper().replace('-', '').replace(' ', '')]
+    total = len(rows)
+    return {"events": [enrich_event(e) for e in rows[(page-1)*page_size:page*page_size]],
+            "total": total, "page": page, "page_size": page_size, "pages": (total+page_size-1)//page_size}
+
+
+@app.get("/api/hotel/events/entries/unpaired")
+def unpaired_entries(authenticated: dict = Depends(check_auth)):
+    return {"events": [enrich_event(e) for e in admin.unpaired("entries")]}
+
+
+@app.get("/api/hotel/events/exits/unpaired")
+def unpaired_exits(entry_event_id: Optional[str] = None, authenticated: dict = Depends(check_auth)):
+    rows = manual_operation(admin.unpaired, "exits", entry_event_id)
+    return {"events": [enrich_event(e) for e in rows]}
 
 
 @app.get("/api/hotel/events/{event_id}")
-def get_hotel_event_detail(event_id: str, authenticated: bool = Depends(check_auth)):
-    """Detalle de un evento específico."""
-    store = HotelStore(config.HOTEL_DATABASE_PATH)
-    try:
-        row = store.get_event(event_id)
-        if not row:
-            raise HTTPException(status_code=404, detail="Event not found")
-        ev = dict(row)
-        ev["evidence_url"] = _relative_evidence_url(ev.get("evidence_path"))
-        ev["clip_url"] = _relative_clip_url(ev.get("clip_path"))
-        
-        # Obtener logs de auditoría para este evento
-        cursor = store.conn.cursor()
-        cursor.execute("SELECT * FROM hotel_event_audit WHERE event_id=? ORDER BY changed_at DESC", (event_id,))
-        ev["audit_logs"] = [dict(r) for r in cursor.fetchall()]
-        
-        return ev
-    finally:
-        store.close()
+def get_hotel_event_detail(event_id: str, authenticated: dict = Depends(check_auth)):
+    with admin.connection() as c:
+        ev = manual_operation(admin.event, c, event_id)
+        ev["audit_logs"] = [dict(r) for r in c.execute(
+            """SELECT a.*,a.created_at AS changed_at,u.username AS changed_by,
+                      'plate' AS field_name FROM audit_log a JOIN users u ON u.id=a.user_id
+               WHERE a.entity_type='event' AND a.entity_id=? ORDER BY a.id DESC""", (event_id,))]
+        ev["legacy_audit_logs"] = [dict(r) for r in c.execute(
+            "SELECT * FROM hotel_event_audit WHERE event_id=? ORDER BY changed_at DESC", (event_id,))]
+    return enrich_event(ev)
+
+
+class PlatePayload(BaseModel):
+    model_config = {"extra": "forbid"}
+    plate: str = Field(min_length=1, max_length=128)
 
 
 @app.patch("/api/hotel/events/{event_id}")
-def patch_hotel_event(event_id: str, payload: dict, authenticated: bool = Depends(check_auth)):
-    """Modifica manualmente los datos de un evento y regenera las visitas."""
-    store = HotelStore(config.HOTEL_DATABASE_PATH)
-    try:
-        success = store.update_event_manually(event_id, payload, changed_by="admin")
-        if not success:
-            raise HTTPException(status_code=404, detail="Event not found")
-        return {"success": True, "message": "Event modified and visits rebuilt."}
-    finally:
-        store.close()
+def patch_hotel_event(event_id: str, payload: PlatePayload, authenticated: dict = Depends(check_auth)):
+    ev = manual_operation(admin.correct_plate, event_id, payload.plate, authenticated)
+    return {"success": True, "event": enrich_event(ev)}
 
 
 @app.post("/api/hotel/events/{event_id}/review")
-def review_hotel_event(payload: Optional[dict] = None, event_id: str = "", authenticated: bool = Depends(check_auth)):
-    """Marca un evento como revisado de forma manual."""
-    store = HotelStore(config.HOTEL_DATABASE_PATH)
-    try:
-        notes = (payload or {}).get("notes", "Revisión completada manualmente.")
-        updates = {"review_required": 0, "notes": notes}
-        success = store.update_event_manually(event_id, updates, changed_by="admin")
-        if not success:
-            raise HTTPException(status_code=404, detail="Event not found")
-        return {"success": True, "message": "Event marked as reviewed."}
-    finally:
-        store.close()
+def review_hotel_event(event_id: str, authenticated: dict = Depends(check_auth)):
+    with admin.connection() as c, c:
+        c.execute("BEGIN IMMEDIATE")
+        original = manual_operation(admin.event, c, event_id)
+        c.execute("UPDATE hotel_vehicle_events SET review_required=0,reviewed_at=?,reviewed_by=? WHERE event_id=?",
+                  (admin.now(), authenticated["username"], event_id))
+        admin.audit(c, authenticated["id"], "EVENT_REVIEWED", "event", event_id, original["review_required"], 0)
+    return {"success": True}
 
 
 @app.post("/api/hotel/export")
@@ -428,40 +408,50 @@ def post_hotel_export(authenticated: bool = Depends(check_auth)):
         store.close()
 
 
+class AssociationPayload(BaseModel):
+    model_config = {"extra": "forbid"}
+    entry_event_id: str = Field(min_length=1, max_length=128)
+    exit_event_id: str = Field(min_length=1, max_length=128)
+
+
+@app.post("/api/hotel/visits/associate")
+def associate_visit(payload: AssociationPayload, authenticated: dict = Depends(check_auth)):
+    visit = manual_operation(admin.associate, payload.entry_event_id, payload.exit_event_id, authenticated)
+    return {"success": True, "visit": visit}
+
+
 @app.get("/api/hotel/visits")
-def get_hotel_visits(page: int = 1, page_size: int = 25, authenticated: bool = Depends(check_auth)):
-    """Retorna listado paginado de visitas vehiculares."""
-    store = HotelStore(config.HOTEL_DATABASE_PATH)
-    try:
-        return store.get_visits_filtered(page=page, page_size=page_size)
-    finally:
-        store.close()
+def get_hotel_visits(page: int = 1, page_size: int = 25, authenticated: dict = Depends(check_auth)):
+    page, page_size = max(1, page), max(1, min(page_size, 100))
+    with admin.connection() as c:
+        total = c.execute("SELECT count(*) FROM manual_visits").fetchone()[0]
+        visits = [dict(r) for r in c.execute("SELECT * FROM manual_visits ORDER BY id DESC LIMIT ? OFFSET ?",
+                                           (page_size, (page-1)*page_size))]
+        for v in visits:
+            v["entry"] = enrich_event(admin.event(c, v["entry_event_id"]))
+            v["exit"] = enrich_event(admin.event(c, v["exit_event_id"]))
+    return {"visits": visits, "total": total, "page": page, "pages": (total+page_size-1)//page_size}
 
 
 @app.get("/api/hotel/visits/{visit_id}")
-def get_hotel_visit_detail(visit_id: str, authenticated: bool = Depends(check_auth)):
-    """Retorna los detalles de una visita específica."""
-    store = HotelStore(config.HOTEL_DATABASE_PATH)
-    try:
-        row = store.get_visit(visit_id)
+def get_hotel_visit_detail(visit_id: int, authenticated: dict = Depends(check_auth)):
+    with admin.connection() as c:
+        row = c.execute("SELECT * FROM manual_visits WHERE id=?", (visit_id,)).fetchone()
         if not row:
-            raise HTTPException(status_code=404, detail="Visit not found")
-        return dict(row)
-    finally:
-        store.close()
+            raise HTTPException(404, "Visita no encontrada.")
+        return {**dict(row), "entry": enrich_event(admin.event(c, row["entry_event_id"])),
+                "exit": enrich_event(admin.event(c, row["exit_event_id"]))}
+
+
+@app.delete("/api/hotel/visits/{visit_id}/association")
+def unlink_visit(visit_id: int, authenticated: dict = Depends(check_auth)):
+    manual_operation(admin.unlink, visit_id, authenticated)
+    return {"success": True}
 
 
 @app.post("/api/hotel/rebuild-visits")
-def post_rebuild_visits(authenticated: bool = Depends(check_auth)):
-    """Reconstruye transaccionalmente la tabla de visitas en base al histórico de eventos."""
-    store = HotelStore(config.HOTEL_DATABASE_PATH)
-    try:
-        store.rebuild_hotel_visits()
-        return {"success": True, "message": "Visits history successfully rebuilt."}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Rebuild failed: {e}")
-    finally:
-        store.close()
+def post_rebuild_visits(authenticated: dict = Depends(check_auth)):
+    raise HTTPException(409, "Las visitas se confirman manualmente. Usa Asociar salida o Desasociar.")
 
 
 # ─── Servicios Seguros de Archivos y Snapshots ───────────────────────

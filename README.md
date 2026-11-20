@@ -1,5 +1,10 @@
 # Deteccion_Carros
 
+El dashboard requiere usuarios SQLite y sesiones revocables. Consulta
+[ADMINISTRATION.md](ADMINISTRATION.md) para crear el primer administrador,
+asociar visitas y entender las métricas. Ese procedimiento sustituye las
+instrucciones históricas de autenticación por variables de entorno.
+
 ## Sistema Profesional de Detección Vehicular con IA
 
 Sistema de control de acceso vehicular basado en inteligencia artificial, diseñado para ejecutarse **on-premise** en hardware económico sin GPU dedicada.
