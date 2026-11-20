@@ -59,3 +59,8 @@ data/validation/
 # Paquetes privados de despliegue
 dist/deteccion-carros-private.tar.gz
 dist/deteccion-carros-private.tar.gz.sha256
+
+# Respaldos locales
+/backups/
+*.bak.*
+*.backup_before_*
