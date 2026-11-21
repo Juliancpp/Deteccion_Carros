@@ -1,0 +1,113 @@
+{
+  "camera_id": "A1",
+  "features": [
+    {
+      "id": "acceso-entry",
+      "kind": "hotel_entry",
+      "points": [
+        [
+          0.5608170844939647,
+          1
+        ],
+        [
+          0.8365831012070566,
+          0.6975206611570248
+        ]
+      ],
+      "enabled": true,
+      "invert_direction": true
+    },
+    {
+      "id": "acceso-exit",
+      "kind": "hotel_exit",
+      "points": [
+        [
+          0.22057567316620247,
+          0.9084297520661158
+        ],
+        [
+          0.4438254410399257,
+          0.6793388429752066
+        ]
+      ],
+      "enabled": true,
+      "invert_direction": false
+    },
+    {
+      "id": "hab-1",
+      "kind": "room",
+      "points": [
+        [
+          0.570312,
+          0.427778
+        ],
+        [
+          0.853906,
+          0.591667
+        ],
+        [
+          0.842187,
+          0.693056
+        ],
+        [
+          0.573438,
+          0.530556
+        ]
+      ],
+      "enabled": true,
+      "invert_direction": false
+    },
+    {
+      "id": "hab-2",
+      "kind": "room",
+      "points": [
+        [
+          0.29,
+          0.28
+        ],
+        [
+          0.38125,
+          0.319444
+        ],
+        [
+          0.382812,
+          0.416667
+        ],
+        [
+          0.289062,
+          0.356944
+        ]
+      ],
+      "enabled": true,
+      "invert_direction": false
+    },
+    {
+      "id": "hab-3",
+      "kind": "room",
+      "points": [
+        [
+          0.18,
+          0.21
+        ],
+        [
+          0.236719,
+          0.226389
+        ],
+        [
+          0.2375,
+          0.313889
+        ],
+        [
+          0.176563,
+          0.281944
+        ]
+      ],
+      "enabled": true,
+      "invert_direction": false
+    }
+  ],
+  "observations": 2,
+  "margin": 0.005,
+  "ttl_seconds": 3.0,
+  "use_for_visits": false
+}

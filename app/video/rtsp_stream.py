@@ -54,6 +54,7 @@ class LatestFrame:
     frame: Any
     captured_at: datetime
     sequence: int
+    generation: tuple[int, int] | None = None
 
 
 @dataclass(frozen=True)
@@ -217,7 +218,7 @@ class RTSPStream:
             if after_sequence is not None and latest.sequence <= after_sequence:
                 return None
             frame = latest.frame.copy() if copy_frame else latest.frame
-            return LatestFrame(frame=frame, captured_at=latest.captured_at, sequence=latest.sequence)
+            return LatestFrame(frame=frame, captured_at=latest.captured_at, sequence=latest.sequence, generation=latest.generation)
 
     def get_status(self) -> StreamStatus:
         with self._lock:
@@ -328,6 +329,7 @@ class RTSPStream:
                         if cv2 is not None:
                             capture.set(cv2.CAP_PROP_POS_FRAMES, 0)
                         with self._lock:
+                            self._latest_frame = None
                             self._loop_count += 1
                             self._frame_sequence = 0  # Trigger de reseteo para el coordinador
                         logger.info("camera=%s event=video_loop_reset loop=%d", self.camera_settings.camera_id, self._loop_count)
@@ -481,6 +483,7 @@ class RTSPStream:
                 frame=frame.copy(),
                 captured_at=captured_at,
                 sequence=self._frame_sequence,
+                generation=(self._reconnect_count, self._loop_count),
             )
             self._last_frame_at = captured_at
             self._connected = True

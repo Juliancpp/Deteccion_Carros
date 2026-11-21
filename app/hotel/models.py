@@ -69,3 +69,4 @@ class HotelVehicleEvent:
     room_runner_up: int | None = None
     room_vote_margin: float = 0.0
     review_reasons_json: str | None = None
+    source: str = "mvp_hotel"

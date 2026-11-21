@@ -18,12 +18,29 @@ class HotelStore:
         self.conn.row_factory = sqlite3.Row
         self._init_schema()
 
+    def save_geometry_events(self, events):
+        with self.conn:
+            self.conn.executemany(
+                """INSERT INTO geometry_events
+                   (session_id,camera_id,track_id,source_sequence,occurred_at,feature_id,event_type)
+                   VALUES (?,?,?,?,?,?,?) ON CONFLICT DO NOTHING""",
+                [(e.session_id, e.camera_id, e.track_id, e.source_sequence, e.occurred_at.isoformat(),
+                  e.feature_id, e.event_type) for e in events],
+            )
+
     def close(self) -> None:
         self.conn.close()
 
     def _init_schema(self) -> None:
         self.conn.executescript(
             """
+            CREATE TABLE IF NOT EXISTS geometry_events (
+                session_id TEXT NOT NULL, camera_id TEXT NOT NULL, track_id INTEGER NOT NULL,
+                source_sequence INTEGER NOT NULL, occurred_at TEXT NOT NULL,
+                feature_id TEXT NOT NULL, event_type TEXT NOT NULL,
+                PRIMARY KEY(session_id, camera_id, track_id, source_sequence, feature_id)
+            );
+            CREATE INDEX IF NOT EXISTS geometry_time ON geometry_events(occurred_at DESC);
             CREATE TABLE IF NOT EXISTS hotel_vehicle_events (
                 event_id TEXT PRIMARY KEY,
                 occurred_at TEXT NOT NULL,
@@ -83,10 +100,22 @@ class HotelStore:
             );
             """
         )
+        # Triggers also protect local draft databases created before validation.
+        for operation in ("INSERT", "UPDATE"):
+            self.conn.execute(f"""
+                CREATE TRIGGER IF NOT EXISTS geometry_validate_{operation}
+                BEFORE {operation} ON geometry_events
+                WHEN NEW.event_type NOT IN ('HOTEL_ENTRY','HOTEL_EXIT','ROOM_ENTRY','ROOM_EXIT','ROOM_APPROACH')
+                  OR trim(NEW.camera_id) = '' OR trim(NEW.feature_id) = '' OR trim(NEW.session_id) = ''
+                  OR typeof(NEW.track_id) != 'integer' OR NEW.track_id < 0
+                  OR typeof(NEW.source_sequence) != 'integer' OR NEW.source_sequence < 0
+                BEGIN SELECT RAISE(ABORT, 'invalid geometry event'); END
+            """)
         self.conn.commit()
 
         # Add missing columns dynamically if they do not exist
         try:
+            self.conn.execute("BEGIN IMMEDIATE")
             cursor = self.conn.cursor()
             cursor.execute("PRAGMA table_info(hotel_vehicle_events)")
             columns = [row["name"] for row in cursor.fetchall()]
@@ -116,7 +145,6 @@ class HotelStore:
             for col_name, col_def in cols_to_add.items():
                 if col_name not in columns:
                     self.conn.execute(f"ALTER TABLE hotel_vehicle_events ADD COLUMN {col_name} {col_def}")
-                    self.conn.commit()
             current = [row["name"] for row in self.conn.execute("PRAGMA table_info(hotel_vehicle_events)").fetchall()]
             for col_name, col_def in {"source": "TEXT NOT NULL DEFAULT 'mvp_hotel'", "source_event_id": "TEXT"}.items():
                 if col_name not in current:
@@ -125,7 +153,8 @@ class HotelStore:
             self.conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS uq_hotel_event_source ON hotel_vehicle_events(source, source_event_id)")
             self.conn.commit()
         except Exception:
-            pass
+            self.conn.rollback()
+            raise
 
     def save_event_and_update_visit(self, event: HotelVehicleEvent) -> None:
         clip_path = getattr(event, "clip_path", None)
@@ -147,67 +176,72 @@ class HotelStore:
         room_vote_margin = getattr(event, "room_vote_margin", 0.0)
         review_reasons_json = getattr(event, "review_reasons_json", None)
 
-        self.conn.execute(
-            """
-            INSERT OR REPLACE INTO hotel_vehicle_events (
-                event_id, occurred_at, camera_id, camera_name, track_id, movement, movement_confidence, event_type,
-                plate, plate_confidence, plate_status, plate_candidates, room_number,
-                room_confidence, room_status, vehicle_class, vehicle_confidence, evidence_path,
-                review_required, notes, clip_path, clip_status, clip_error, reviewed_at, reviewed_by,
-                corrected_at, correction_notes, logical_vehicle_id, original_track_ids_json,
-                plate_raw_candidates_json, plate_runner_up, plate_runner_up_confidence,
-                plate_vote_margin, plate_supporting_frames_json, room_score_breakdown_json,
-                room_runner_up, room_vote_margin, review_reasons_json, source, source_event_id
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                event.event_id,
-                event.occurred_at.isoformat() if isinstance(event.occurred_at, datetime) else str(event.occurred_at),
-                event.camera_id,
-                event.camera_name,
-                event.track_id,
-                event.movement,
-                event.movement_confidence,
-                event.event_type,
-                event.plate,
-                event.plate_confidence,
-                event.plate_status,
-                json.dumps(event.plate_candidates, ensure_ascii=False) if isinstance(event.plate_candidates, list) else str(event.plate_candidates),
-                event.room_number,
-                event.room_confidence,
-                event.room_status,
-                event.vehicle_class,
-                event.vehicle_confidence,
-                event.evidence_path,
-                1 if event.review_required else 0,
-                event.notes,
-                clip_path,
-                clip_status,
-                clip_error,
-                reviewed_at,
-                reviewed_by,
-                corrected_at,
-                correction_notes,
-                logical_vehicle_id,
-                original_track_ids_json,
-                plate_raw_candidates_json,
-                plate_runner_up,
-                plate_runner_up_confidence,
-                plate_vote_margin,
-                plate_supporting_frames_json,
-                room_score_breakdown_json,
-                room_runner_up,
-                room_vote_margin,
-                review_reasons_json,
-                "mvp_hotel",
-                event.event_id,
-            ),
-        )
-        self._update_visit(event)
-        self.conn.commit()
+        insert = "INSERT" if event.source == "geometry_gate" else "INSERT OR REPLACE"
+        conflict = "ON CONFLICT(event_id) DO NOTHING" if event.source == "geometry_gate" else ""
+        with self.conn:
+            cursor = self.conn.execute(
+                f"""
+                {insert} INTO hotel_vehicle_events (
+                    event_id, occurred_at, camera_id, camera_name, track_id, movement, movement_confidence, event_type,
+                    plate, plate_confidence, plate_status, plate_candidates, room_number,
+                    room_confidence, room_status, vehicle_class, vehicle_confidence, evidence_path,
+                    review_required, notes, clip_path, clip_status, clip_error, reviewed_at, reviewed_by,
+                    corrected_at, correction_notes, logical_vehicle_id, original_track_ids_json,
+                    plate_raw_candidates_json, plate_runner_up, plate_runner_up_confidence,
+                    plate_vote_margin, plate_supporting_frames_json, room_score_breakdown_json,
+                    room_runner_up, room_vote_margin, review_reasons_json, source, source_event_id
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                {conflict}
+                """,
+                (
+                    event.event_id,
+                    event.occurred_at.isoformat() if isinstance(event.occurred_at, datetime) else str(event.occurred_at),
+                    event.camera_id,
+                    event.camera_name,
+                    event.track_id,
+                    event.movement,
+                    event.movement_confidence,
+                    event.event_type,
+                    event.plate,
+                    event.plate_confidence,
+                    event.plate_status,
+                    json.dumps(event.plate_candidates, ensure_ascii=False) if isinstance(event.plate_candidates, list) else str(event.plate_candidates),
+                    event.room_number,
+                    event.room_confidence,
+                    event.room_status,
+                    event.vehicle_class,
+                    event.vehicle_confidence,
+                    event.evidence_path,
+                    1 if event.review_required else 0,
+                    event.notes,
+                    clip_path,
+                    clip_status,
+                    clip_error,
+                    reviewed_at,
+                    reviewed_by,
+                    corrected_at,
+                    correction_notes,
+                    logical_vehicle_id,
+                    original_track_ids_json,
+                    plate_raw_candidates_json,
+                    plate_runner_up,
+                    plate_runner_up_confidence,
+                    plate_vote_margin,
+                    plate_supporting_frames_json,
+                    room_score_breakdown_json,
+                    room_runner_up,
+                    room_vote_margin,
+                    review_reasons_json,
+                    event.source,
+                    event.event_id,
+                ),
+            )
+            if cursor.rowcount:
+                self._update_visit(event)
+
 
     def _update_visit(self, event: HotelVehicleEvent) -> None:
-        if not event.plate or event.plate_status == "NO_LEGIBLE":
+        if not _eligible_for_visit(event):
             return
         open_visit = self.get_open_visit(event.plate)
         if event.event_type in {"ENTRADA_NORMAL", "ENTRADA_POR_SALIDA"}:
@@ -517,9 +551,10 @@ class HotelStore:
                 vehicle_confidence=row["vehicle_confidence"],
                 evidence_path=row["evidence_path"],
                 review_required=bool(row["review_required"]),
+                source=row["source"],
                 notes=row["notes"]
             )
-            if not event.plate or event.plate_status == "NO_LEGIBLE":
+            if not _eligible_for_visit(event):
                 continue
                 
             cursor.execute(
@@ -565,6 +600,14 @@ class HotelStore:
                         open_visit["visit_id"],
                     ),
                 )
+
+
+def _eligible_for_visit(event: HotelVehicleEvent) -> bool:
+    if event.source == "geometry_gate" and (
+        event.review_required or event.plate_status != "LEIDA" or not event.evidence_path
+    ):
+        return False
+    return bool(event.plate) and event.plate_status != "NO_LEGIBLE"
 
 
 def classify_event(camera_id: str, movement: str, plate: str | None, store: HotelStore | None) -> tuple[str, bool, str]:

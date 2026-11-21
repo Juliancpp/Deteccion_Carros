@@ -8,6 +8,7 @@ import signal
 import sys
 import time
 import json
+from collections import deque
 from datetime import datetime
 from pathlib import Path
 import threading
@@ -63,7 +64,12 @@ def main() -> int:
     print(f"[RUNNER] Iniciando MVP de Hotel para camaras: {[c.camera_id for c in cameras]}")
 
     # Inicializar componentes
-    coordinator = MultiCameraCoordinator(settings.dvr, cameras)
+    geometry_store = HotelStore(config.HOTEL_DATABASE_PATH) if any(c.enabled and c.geometry for c in cameras) else None
+    pending_geometry = deque()
+    coordinator = MultiCameraCoordinator(
+        settings.dvr, cameras,
+        geometry_sink=pending_geometry.append if geometry_store else None,
+    )
     frame_buffer = TrackFrameBuffer(max_candidates=6, ttl_seconds=20.0)
     analyzers = {camera.camera_id: HotelPhase1Analyzer(camera) for camera in cameras}
 
@@ -118,12 +124,19 @@ def main() -> int:
         next_status = 0.0
 
         while time.monotonic() < end_at and not shutdown_event.is_set():
+            if geometry_store:
+                _flush_geometry(geometry_store, pending_geometry)
+            if not coordinator.is_running():
+                raise RuntimeError("El coordinador de inferencia se detuvo")
             for camera in cameras:
                 try:
-                    result = coordinator.get_latest_result(camera.camera_id, after_sequence=last_sequences[camera.camera_id])
+                    result = coordinator.get_latest_result(camera.camera_id, after_sequence=last_sequences[camera.camera_id],
+                                                           after_session=analyzers[camera.camera_id].session_id)
                     if result is None:
                         continue
 
+                    if analyzers[camera.camera_id].session_id != result.session_id:
+                        analyzers[camera.camera_id] = HotelPhase1Analyzer(camera, session_id=result.session_id)
                     last_sequences[camera.camera_id] = result.source_sequence
 
                     # Feed clip buffers
@@ -142,7 +155,8 @@ def main() -> int:
                     now_mono = time.monotonic()
                     if args.latest_snapshots and result.raw_frame is not None and now_mono - last_snapshot_write[camera.camera_id] >= 1.0:
                         try:
-                            if atomic_write_jpeg(runtime_snapshot_path(camera.camera_id), result.raw_frame):
+                            preview = result.annotated_frame if camera.geometry and result.annotated_frame is not None else result.raw_frame
+                            if atomic_write_jpeg(runtime_snapshot_path(camera.camera_id), preview):
                                 last_snapshot_write[camera.camera_id] = now_mono
                         except Exception as exc:
                             print(f"[RUNNER] Snapshot fallo en {camera.camera_id}: {exc}")
@@ -154,7 +168,8 @@ def main() -> int:
                             try:
                                 frame_buffer.add(
                                     camera_id=camera.camera_id,
-                                    track_id=vehicle["track_id"],
+                                    track_id=vehicle["id"],
+                                    session_id=result.session_id,
                                     frame=frame_to_buffer,
                                     vehicle=vehicle,
                                     captured_at=result.captured_at
@@ -194,8 +209,16 @@ def main() -> int:
         if clip_manager is not None:
             clip_manager.stop(drain=True)
             
-        consumer.stop(drain=True)
         scheduler_ok = coordinator.stop(stop_streams=False)
+        consumer.stop(drain=True)
+        if geometry_store and scheduler_ok:
+            try:
+                _flush_geometry(geometry_store, pending_geometry)
+            except Exception as exc:
+                print(f"[RUNNER] Falló persistencia de geometría: {exc}")
+                exit_code = 1
+            finally:
+                geometry_store.close()
         streams_ok = _stop_streams(coordinator)
         coordinator.contexts.clear()
         
@@ -225,6 +248,13 @@ def main() -> int:
     print(f"[RUNNER] RAM inicial/final: {ram_started:.1f}MB/{_rss_mb():.1f}MB")
     print("[RUNNER] Cierre y guardado completados limpiamente." if exit_code == 0 else "[RUNNER] Cierre con advertencias/errores")
     return exit_code
+
+
+def _flush_geometry(store, pending):
+    # Only the scheduler appends and only the runner removes committed batches.
+    for _ in range(len(pending)):
+        store.save_geometry_events(pending[0])
+        pending.popleft()
 
 
 def _print_status(coordinator, analyzers, consumer):

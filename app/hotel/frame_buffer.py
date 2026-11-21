@@ -47,15 +47,15 @@ class TrackFrameBuffer:
         self.max_candidates = max_candidates
         self.ttl_seconds = ttl_seconds
         self._time_fn = time_fn
-        self._buffers: dict[tuple[str, int], list[FrameCandidate]] = {}
-        self._last_seen: dict[tuple[str, int], float] = {}
+        self._buffers: dict[tuple[str, str, int], list[FrameCandidate]] = {}
+        self._last_seen: dict[tuple[str, str, int], float] = {}
         self._lock = threading.Lock()
         self.candidates_stored = 0
         self.candidates_discarded = 0
 
-    def add(self, camera_id: str, track_id: int, frame: np.ndarray, vehicle: dict, captured_at) -> None:
+    def add(self, camera_id: str, track_id: int, frame: np.ndarray, vehicle: dict, captured_at, *, session_id: str = "") -> None:
         with self._lock:
-            key = (camera_id, int(track_id))
+            key = (camera_id, session_id, int(track_id))
             bbox = tuple(int(value) for value in vehicle["bbox"])
             metrics = candidate_metrics(frame, bbox, float(vehicle.get("confidence", 0.0)))
             source_sequence = _optional_int(vehicle.get("source_sequence") or vehicle.get("sequence"))
@@ -97,19 +97,19 @@ class TrackFrameBuffer:
             self._last_seen[key] = self._time_fn()
             self._cleanup_nolock()
 
-    def best(self, camera_id: str, track_id_or_ids: int | list[int] | set[int], limit: int = 5) -> list[FrameCandidate]:
+    def best(self, camera_id: str, track_id_or_ids: int | list[int] | set[int], limit: int = 5, *, session_id: str = "") -> list[FrameCandidate]:
         with self._lock:
             if isinstance(track_id_or_ids, (list, tuple, set)):
                 merged: list[FrameCandidate] = []
                 for track_id in track_id_or_ids:
-                    merged.extend(self._buffers.get((camera_id, int(track_id)), []))
+                    merged.extend(self._buffers.get((camera_id, session_id, int(track_id)), []))
                 merged.sort(key=lambda item: item.quality_score, reverse=True)
                 return list(merged[:limit])
-            return list(self._buffers.get((camera_id, int(track_id_or_ids)), []))[:limit]
+            return list(self._buffers.get((camera_id, session_id, int(track_id_or_ids)), []))[:limit]
 
-    def remove(self, camera_id: str, track_id: int) -> None:
+    def remove(self, camera_id: str, track_id: int, *, session_id: str = "") -> None:
         with self._lock:
-            key = (camera_id, int(track_id))
+            key = (camera_id, session_id, int(track_id))
             self._buffers.pop(key, None)
             self._last_seen.pop(key, None)
 

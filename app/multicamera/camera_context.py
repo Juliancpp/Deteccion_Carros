@@ -39,6 +39,8 @@ class CameraContext:
     last_event_direction: str | None = None
     last_event_track_id: int | None = None
     last_error: str | None = None
+    geometry_detector: Any | None = None
+    session_id: str = ""
 
 
 @dataclass(frozen=True)
@@ -53,6 +55,7 @@ class CameraInferenceResult:
     tracked_vehicles: tuple[dict[str, Any], ...]
     annotated_frame: Any | None = None
     raw_frame: Any | None = None
+    session_id: str = ""
 
 
 @dataclass(frozen=True)

@@ -8,6 +8,7 @@ solo se activa explicitamente para pruebas; nunca se usa silenciosamente.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from itertools import count
 from types import SimpleNamespace
 from typing import Any
 
@@ -98,6 +99,18 @@ class ByteTrackAdapter:
 def _create_ultralytics_bytetrack():
     from ultralytics.trackers.byte_tracker import BYTETracker
 
+    class CameraTracker(BYTETracker):
+        """Ultralytics defaults to a process-global ID allocator, even on reset."""
+
+        def reset_id(self):
+            self._camera_ids = count(1)
+
+        def init_track(self, *args, **kwargs):
+            tracks = super().init_track(*args, **kwargs)
+            for track in tracks:
+                track.next_id = self._camera_ids.__next__
+            return tracks
+
     args = SimpleNamespace(
         tracker_type="bytetrack",
         track_high_thresh=0.25,
@@ -107,7 +120,7 @@ def _create_ultralytics_bytetrack():
         match_thresh=0.8,
         fuse_score=True,
     )
-    return BYTETracker(args)
+    return CameraTracker(args)
 
 
 def _track_row_to_vehicle(row: np.ndarray, detections: list[dict[str, Any]]) -> dict[str, Any]:

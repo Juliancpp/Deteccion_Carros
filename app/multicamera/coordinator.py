@@ -11,6 +11,9 @@ from dataclasses import dataclass
 from typing import Any, Callable
 
 from app import config
+from app.hotel.geometry import GeometryDetector, GeometryEvent
+from app.hotel.gate_detector import bottom_center
+from app.hotel.geometry_overlay import draw_features
 from app.detector import VehicleDetector
 from app.line_detector import VirtualLineDetector, LineCrossing
 from app.multicamera.camera_context import (
@@ -92,6 +95,7 @@ class MultiCameraCoordinator:
         dvr_settings: DVRSettings,
         camera_settings: list[CameraSettings],
         *,
+        geometry_sink: Callable[[list[GeometryEvent]], None] | None = None,
         detector: Any | None = None,
         detector_factory: DetectorFactory = VehicleDetector,
         stream_factory: StreamFactory | None = None,
@@ -101,6 +105,7 @@ class MultiCameraCoordinator:
         idle_sleep_seconds: float = config.INFERENCE_SCHEDULER_IDLE_SLEEP_SECONDS,
         status_window_seconds: float = config.INFERENCE_STATUS_WINDOW_SECONDS,
     ) -> None:
+        self.geometry_sink = geometry_sink
         self.dvr_settings = dvr_settings
         self.camera_settings = [camera for camera in camera_settings if camera.enabled]
         self.detector = detector if detector is not None else detector_factory()
@@ -131,7 +136,8 @@ class MultiCameraCoordinator:
             if hasattr(tracker, "ensure_ready"):
                 tracker.ensure_ready()
             tracker_backend = getattr(tracker, "tracker_backend", "unknown")
-            line_detector = self._line_detector_factory(camera)
+            use_geometry = camera.geometry and camera.geometry.use_for_visits
+            line_detector = None if use_geometry else self._line_detector_factory(camera)
             self.contexts.append(
                 CameraContext(
                     camera_id=camera.camera_id,
@@ -141,6 +147,7 @@ class MultiCameraCoordinator:
                     tracker=tracker,
                     line_detector=line_detector,
                     tracker_backend=tracker_backend,
+                    geometry_detector=GeometryDetector(camera.geometry) if camera.geometry else None,
                 )
             )
 
@@ -192,18 +199,20 @@ class MultiCameraCoordinator:
         after_sequence: int | None = None,
         *,
         copy_frame: bool = True,
+        after_session: str | None = None,
     ) -> CameraInferenceResult | None:
         with self._lock:
             context = self._context_by_id(camera_id)
             if context is None or context.last_result is None:
                 return None
             result = context.last_result
-            if after_sequence is not None and result.source_sequence <= after_sequence:
+            if after_session in (None, result.session_id) and after_sequence is not None and result.source_sequence <= after_sequence:
                 return None
             if copy_frame and result.annotated_frame is not None:
                 return CameraInferenceResult(
                     camera_id=result.camera_id,
                     camera_name=result.camera_name,
+                    session_id=result.session_id,
                     source_sequence=result.source_sequence,
                     captured_at=result.captured_at,
                     processed_at=result.processed_at,
@@ -274,6 +283,11 @@ class MultiCameraCoordinator:
             context.source_sequence = stream_status.frame_sequence
             return False
 
+        generation = getattr(latest, "generation", None)
+        if generation is not None and generation != (context.last_reconnect_count, context.last_loop_count):
+            # Capture crossed a reconnect/rewind between the two snapshot reads.
+            # Leave this frame unconsumed until status and frame agree.
+            return False
         skipped = max(0, latest.sequence - context.last_consumed_sequence - 1)
         context.source_sequence = latest.sequence
         frame = latest.frame.copy()
@@ -302,9 +316,10 @@ class MultiCameraCoordinator:
             tracked = []
             logger.exception("camera=%s event=tracker_error", context.camera_id)
 
-        confirmations = self._process_passage_confirmations(context, tracked, frame, latest)
+        self._process_crossings(context, tracked, frame, latest, now)
         annotated = self._annotate_frame(frame, context, tracked, inference_ms)
         result = CameraInferenceResult(
+            session_id=context.session_id,
             camera_id=context.camera_id,
             camera_name=context.camera_name,
             source_sequence=latest.sequence,
@@ -328,7 +343,10 @@ class MultiCameraCoordinator:
             context.skipped_frames += skipped
             context.detections_count = len(detections)
             context.active_track_ids = _active_ids(context.tracker, tracked)
-            context.crossing_candidates = _line_metric(context.line_detector, "confirmed_count")
+            if context.geometry_detector and context.geometry_detector.layout.use_for_visits:
+                context.crossing_candidates = context.events_published + context.event_queue_dropped
+            else:
+                context.crossing_candidates = _line_metric(context.line_detector, "confirmed_count")
             context.duplicate_events_suppressed = _line_metric(context.line_detector, "duplicate_suppressed_count")
             context.inference_times.append(context.last_inference_at)
             self._prune_window(context.inference_times, context.last_inference_at)
@@ -337,6 +355,29 @@ class MultiCameraCoordinator:
             self._inference_times.append(time.monotonic())
             self._prune_window(self._inference_times, time.monotonic())
         return True
+
+    def _process_crossings(self, context, tracked, frame, latest, now):
+        geometry = context.geometry_detector
+        if geometry is not None:
+            height, width = frame.shape[:2]
+            events = geometry.update(tracked, width, height, latest.captured_at, latest.sequence, now)
+            if events and self.geometry_sink is not None:
+                self.geometry_sink(events)
+            if geometry.layout.use_for_visits:
+                for event in events:
+                    if event.event_type not in {"HOTEL_ENTRY", "HOTEL_EXIT"}:
+                        continue
+                    vehicle = _vehicle_by_track_id(tracked, event.track_id)
+                    direction = "INWARD" if event.event_type == "HOTEL_ENTRY" else "OUTWARD"
+                    crossing = NormalizedCrossing(
+                        event.track_id, direction, bottom_center(vehicle["bbox"]), event.occurred_at
+                    )
+                    candidate = self._event_from_confirmation(
+                        context, crossing, vehicle, frame, latest.sequence, width, height
+                    )
+                    self._publish_event(context, candidate)
+                return
+        self._process_passage_confirmations(context, tracked, frame, latest)
 
     def _process_passage_confirmations(self, context: CameraContext, tracked: list[dict], frame, latest) -> list[NormalizedCrossing]:
         if context.line_detector is None:
@@ -419,6 +460,8 @@ class MultiCameraCoordinator:
             frame=frame_copy,
             track_point=confirmation.track_point,
             corridor_progress=confirmation.corridor_progress,
+            session_id=context.session_id,
+            geometry_gate=bool(context.geometry_detector and context.geometry_detector.layout.use_for_visits),
         )
 
     def _publish_event(self, context: CameraContext, event: EventCandidate) -> None:
@@ -453,6 +496,11 @@ class MultiCameraCoordinator:
 
         if reconnected or sequence_reset or loop_reset:
             context.tracker.reset()
+            if context.geometry_detector is not None:
+                context.geometry_detector.reset()
+                context.session_id = context.geometry_detector.session_id
+            else:
+                context.session_id = uuid.uuid4().hex
             if context.line_detector is not None:
                 context.line_detector.reset()
             context.last_consumed_sequence = 0
@@ -472,6 +520,8 @@ class MultiCameraCoordinator:
         annotated = self.detector.draw_detections(frame, tracked)
         fps = self._actual_fps(context, time.monotonic())
         self._draw_passage(annotated, context)
+        if context.geometry_detector is not None:
+            draw_features(annotated, context.geometry_detector.features)
         self._draw_centers(annotated, tracked)
         lines = [
             f"{context.camera_id} {context.camera_name}",
