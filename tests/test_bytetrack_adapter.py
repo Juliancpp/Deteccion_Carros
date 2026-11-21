@@ -102,3 +102,14 @@ def test_iou_fallback_requires_explicit_opt_in(monkeypatch):
 
     assert tracker.tracker_backend == "iou-test-fallback"
     assert tracked[0]["id"] == 1
+
+
+def test_peer_reset_does_not_recycle_active_ids():
+    frame = np.zeros((720, 1280, 3), dtype=np.uint8)
+    first, second = ByteTrackAdapter("A1"), ByteTrackAdapter("A5")
+    second.update([detection()], frame=frame)
+    first.update([detection()], frame=frame)
+    second.reset()
+    vehicles = [detection(), detection(400, 200, 480, 290)]
+    first.update(vehicles, frame=frame)
+    assert {v["id"] for v in first.update(vehicles, frame=frame)} == {1, 2}

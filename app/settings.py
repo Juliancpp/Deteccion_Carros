@@ -15,6 +15,8 @@ from urllib.parse import quote, unquote, urlsplit, urlunsplit
 
 from dotenv import load_dotenv
 
+from app.hotel.geometry import Layout
+
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 DEFAULT_ENV_PATH = BASE_DIR / ".env"
@@ -95,6 +97,7 @@ class CameraSettings:
     rooms: tuple[RoomZoneSettings, ...] = ()
     video_path: str | None = None
     video_loop: bool = True
+    geometry: Layout | None = None
 
 
 
@@ -234,7 +237,15 @@ def _load_camera(source: Mapping[str, str], prefix: str) -> CameraSettings:
     loop_val = str(source.get(f"{prefix}_VIDEO_LOOP", "true")).strip().lower()
     video_loop = loop_val not in {"false", "0"}
     
+    geometry = None
+    geometry_file = source.get(f"{prefix}_GEOMETRY_FILE", "").strip()
+    if geometry_file:
+        try:
+            geometry = Layout.load(BASE_DIR / geometry_file, _required_str(source, f"{prefix}_ID"))
+        except (OSError, ValueError, TypeError) as exc:
+            raise SettingsError(f"{prefix}_GEOMETRY_FILE inválido: {exc}") from exc
     return CameraSettings(
+        geometry=geometry,
         camera_id=_required_str(source, f"{prefix}_ID"),
         name=_required_str(source, f"{prefix}_NAME"),
         enabled=_required_bool(source, f"{prefix}_ENABLED"),

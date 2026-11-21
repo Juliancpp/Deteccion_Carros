@@ -62,8 +62,11 @@ def runtime_fixture(tmp_path, monkeypatch, client):
 
 
 def test_authenticated_dashboard_contract(client, runtime_fixture):
+    assert client.get('/api/hotel/geometry-events').status_code == 401
     assert client.get('/api/hotel/cameras/A1/snapshot').status_code == 401
     login(client)
+    assert client.get('/api/hotel/geometry-events').json() == []
+    assert client.get('/api/hotel/geometry-events?limit=501').status_code == 422
     html = client.get('/')
     assert html.status_code == 200
     parsed = DashboardHTML(html.text)
@@ -106,6 +109,8 @@ def browser_page(client, runtime_fixture):
         with sync_playwright() as p:
             browser = p.chromium.launch(headless=True)
             page = browser.new_page()
+            # The six isolated events are dated September 1. Keep polling timers real.
+            page.clock.set_fixed_time("2026-09-15T12:00:00Z")
             page.set_default_timeout(8000)
             yield page, f'http://127.0.0.1:{port}'
             browser.close()
@@ -173,7 +178,11 @@ def test_browser_missing_feature_and_snapshot_failure_are_isolated(browser_page)
     expect(page.locator('#eventsTable tr')).to_have_count(6)
     expect(page.locator('#statEntradas')).to_have_text('2')
     expect(page.locator('#camA1_overlay')).to_have_text('SIN IMAGEN')
-    page.evaluate('initializeDashboard(); initializeDashboard(); startPolling(); startPolling();')
+    session_checks = []
+    page.on('request', lambda req: session_checks.append(req.url) if req.url.endswith('/api/auth/me') else None)
+    page.evaluate('Promise.all([initializeDashboard(), initializeDashboard()])')
+    page.evaluate('startPolling(); startPolling();')
+    assert not session_checks
     assert page.evaluate('pollingTimers.length') == 4
     assert any('Asociación: faltan elementos DOM: associationModal' in msg for msg in logs)
     page.locator('#logoutBtn').click()
@@ -217,3 +226,25 @@ def test_database_path_is_independent_of_cwd(client, tmp_path, monkeypatch):
         actual = conn.execute('PRAGMA database_list').fetchone()[2]
         assert actual == config.HOTEL_DATABASE_PATH
         assert Path(actual).is_absolute()
+
+
+def test_vehicle_routes_and_populated_geometry_require_active_session(client):
+    from datetime import datetime, timezone
+    from app.hotel.geometry import GeometryEvent
+    from app.hotel.store import HotelStore
+    endpoint = "/api/hotel/geometry-events"
+    store = HotelStore(config.HOTEL_DATABASE_PATH)
+    store.save_geometry_events([GeometryEvent("sess", "A5", 7, 9, datetime.now(timezone.utc), "hab-5", "ROOM_ENTRY")])
+    store.close()
+    for url in (endpoint, "/api/events", "/api/hotel/events", "/api/hotel/events/entry",
+                "/api/hotel/visits", "/api/hotel/status", "/api/hotel/cameras/A1/snapshot",
+                "/downloads/control_vehiculos.xlsx", "/media/clips/A1/2026-09-01/file.mp4"):
+        assert client.get(url).status_code == 401
+    login(client)
+    r = client.get(endpoint)
+    assert r.status_code == 200 and r.headers["cache-control"] == "no-store"
+    assert [e["feature_id"] for e in r.json()] == ["hab-5"]
+    token = client.cookies.get(api.SESSION_COOKIE)
+    assert client.post('/api/auth/logout').status_code == 200
+    client.cookies.set(api.SESSION_COOKIE, token)
+    assert client.get(endpoint).status_code == 401

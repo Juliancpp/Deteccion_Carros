@@ -25,8 +25,9 @@ class _TrackPhase1State:
 
 
 class HotelPhase1Analyzer:
-    def __init__(self, camera: CameraSettings, *, time_fn=time.time) -> None:
+    def __init__(self, camera: CameraSettings, *, time_fn=time.time, session_id: str = "") -> None:
         self.camera = camera
+        self.session_id = session_id
         self._time_fn = time_fn
         corridor = camera.corridor
         self.corridor = DirectionalCorridor(

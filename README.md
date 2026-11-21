@@ -384,6 +384,8 @@ CAMERA_A1_CORRIDOR_POINTS=0.27,0.98;0.43,0.83;0.59,0.69;0.70,0.58
 CAMERA_A1_CORRIDOR_HALF_WIDTH=0.08
 ```
 
+Para calibrar líneas de acceso independientes, zonas de habitación o grupos y pasos de aproximación, consulta la [guía de geometría por cámara](GEOMETRIA_HOTEL.md).
+
 Calibración sin GUI, guardando snapshots con el corredor actual:
 
 ```bash

@@ -14,7 +14,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
-from fastapi import FastAPI, Depends, HTTPException, Request, Response
+from fastapi import Query, FastAPI, Depends, HTTPException, Request, Response
 from fastapi.responses import FileResponse, HTMLResponse
 from fastapi.staticfiles import StaticFiles
 from dotenv import load_dotenv
@@ -300,6 +300,13 @@ def manual_operation(function, *args):
         raise HTTPException(409, str(exc)) from exc
     except ValueError as exc:
         raise HTTPException(422, str(exc)) from exc
+
+
+@app.get("/api/hotel/geometry-events")
+def geometry_events(limit: int = Query(100, ge=1, le=500), authenticated: dict = Depends(check_auth)):
+    with admin.connection() as conn:
+        rows = conn.execute("SELECT * FROM geometry_events ORDER BY occurred_at DESC, rowid DESC LIMIT ?", (limit,))
+        return [dict(row) for row in rows]
 
 
 @app.get("/api/hotel/events")

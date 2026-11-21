@@ -30,6 +30,8 @@ class EventCandidate:
     vehicle_class: str = ""
     detection_confidence: float = 0.0
     logical_id: int | None = None
+    geometry_gate: bool = False
+    session_id: str = ""
 
 
     def __post_init__(self):

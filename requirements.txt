@@ -11,6 +11,7 @@ opencv-python>=4.9.0        # Procesamiento de video/imagen
 
 # ── Computación numérica ──
 numpy>=1.26.0               # Operaciones con arrays
+shapely>=2.0
 
 # ── OCR de placas ──
 easyocr>=1.7.1              # Lectura básica de placas en CPU

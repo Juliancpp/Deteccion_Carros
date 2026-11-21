@@ -1,3 +1,4 @@
+import json
 import logging
 import os
 import queue
@@ -311,7 +312,7 @@ class MultiCameraEventConsumer:
                 cand = pending["candidate"]
                 first_seen = pending["first_seen"]
 
-                analyzer = self.analyzers.get(cand.camera_id)
+                analyzer = self._candidate_analyzer(cand)
                 track_result = None
                 if analyzer:
                     track_result = analyzer._latest_results.get(cand.track_id)
@@ -354,6 +355,12 @@ class MultiCameraEventConsumer:
         if not self._pending_events:
             return None
         return max(0.0, time.monotonic() - min(item["first_seen"] for item in self._pending_events))
+
+    def _candidate_analyzer(self, candidate):
+        analyzer = self.analyzers.get(candidate.camera_id) if self.analyzers else None
+        if candidate.session_id and getattr(analyzer, "session_id", "") != candidate.session_id:
+            return None
+        return analyzer
 
     def _process_candidate_safely(self, candidate: EventCandidate, track_result: Optional[Any]) -> None:
         try:
@@ -416,19 +423,25 @@ class MultiCameraEventConsumer:
                 room_confidence = 0.0
                 room_status = "NO_DETERMINADA"
 
+            if candidate.geometry_gate:
+                movement = candidate.direction
+                movement_confidence = 1.0
+
             # Get logical track ID and linked track IDs from analyzer's linker
             logical_id = candidate.track_id
             linked_track_ids = {candidate.track_id}
-            analyzer = self.analyzers.get(candidate.camera_id) if self.analyzers is not None else None
+            analyzer = self._candidate_analyzer(candidate)
             if analyzer and hasattr(analyzer, "linker"):
                 logical_id = analyzer.linker.get_logical_id(candidate.camera_id, candidate.track_id)
                 linked_track_ids = analyzer.linker.get_linked_track_ids(candidate.camera_id, logical_id)
 
             # 4. OCR Multiframe
             ocr_candidates = []
-            if self.frame_buffer and candidate.track_id:
+            if self.frame_buffer and candidate.track_id is not None:
                 # Obtener mejores frames del buffer de track
-                candidates_frames = self.frame_buffer.best(candidate.camera_id, linked_track_ids, limit=5)
+                candidates_frames = self.frame_buffer.best(
+                    candidate.camera_id, linked_track_ids, limit=5, session_id=candidate.session_id
+                )
                 for cf in candidates_frames:
                     ocr_candidates.append({
                         "frame": cf.frame,
@@ -516,6 +529,14 @@ class MultiCameraEventConsumer:
                 if "placa no legible" not in notes:
                     notes = f"placa no legible; {notes}" if notes else "placa no legible"
 
+            if candidate.geometry_gate and plate_status == "PROBABLE":
+                review_required = True
+                notes = self._append_note(notes, "placa probable sin consenso suficiente")
+
+            if candidate.geometry_gate and room_status == "PROBABLE":
+                review_required = True
+                notes = self._append_note(notes, "habitación probable pendiente de revisión")
+
             if room_status == "NO_DETERMINADA" or room_number is None:
                 review_required = True
                 if "habitacion no determinada" not in notes:
@@ -580,7 +601,7 @@ class MultiCameraEventConsumer:
             if self.hotel_store:
                 try:
                     hotel_event = HotelVehicleEvent(
-                        event_id=f"{candidate.camera_id}-{logical_id}-{candidate.captured_at.strftime('%H%M%S')}",
+                        event_id=candidate.event_id if candidate.session_id or candidate.geometry_gate else f"{candidate.camera_id}-{logical_id}-{candidate.captured_at.strftime('%H%M%S')}",
                         occurred_at=candidate.captured_at,
                         camera_id=candidate.camera_id,
                         camera_name=candidate.camera_name,
@@ -599,6 +620,9 @@ class MultiCameraEventConsumer:
                         evidence_path=evidence_path,
                         review_required=review_required,
                         notes=notes,
+                        source="geometry_gate" if candidate.geometry_gate else "mvp_hotel",
+                        plate_supporting_frames_json=json.dumps(voted_res.get("supporting_frame_ids", ())),
+                        plate_vote_margin=float(voted_res.get("vote_margin", 0.0)),
                         plate_candidates=plate_candidates_list
                     )
                     self._save_hotel_event_with_retry(hotel_event)
