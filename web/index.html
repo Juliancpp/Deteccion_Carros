@@ -1,10 +1,165 @@
 <!doctype html>
-<html lang="es"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Control Vehicular · Hotel Relax</title><link rel="stylesheet" href="/static/style.css"></head><body>
-<aside class="sidebar"><div class="brand"><span class="brand-mark">HR</span><div><strong>Hotel Relax</strong><small>Control vehicular</small></div></div><nav><a class="active" href="#control">🚗 <span>Control Vehicular</span></a><a href="#historial">🕒 <span>Historial</span></a><a href="#reportes">📊 <span>Reportes</span></a><a href="#camaras">📹 <span>Cámaras</span></a><a href="#configuracion">⚙ <span>Configuración</span></a></nav><div class="sidebar-foot"><i></i>Servicio protegido</div></aside>
-<main class="shell" id="control"><header class="topbar"><div><p class="eyebrow">OPERACIONES · HOTEL RELAX</p><h1>Control Vehicular</h1><p class="subtitle">Monitorea y gestiona el acceso de vehículos al hotel</p></div><div class="top-actions"><span id="detectorStatus" class="status-pill">Cargando detector...</span><label class="month-control"><span>Periodo</span><input id="monthPicker" type="month"></label><span id="userGreeting" class="user-greeting">Sesión activa</span><button id="logoutBtn" class="btn-ghost" type="button">Cerrar sesión</button></div></header>
-<section class="kpi-grid"><article class="kpi"><b class="kpi-icon blue">↗</b><div><span>Entradas</span><strong id="statEntradas">0</strong><small id="periodEntradas">Mes actual</small></div></article><article class="kpi"><b class="kpi-icon cyan">↘</b><div><span>Salidas</span><strong id="statSalidas">0</strong><small id="periodSalidas">Mes actual</small></div></article><article class="kpi"><b class="kpi-icon green">✓</b><div><span>Visitas completadas</span><strong id="statVisitasActivas">0</strong><small id="periodVisitas">Mes actual</small></div></article><article class="kpi"><b class="kpi-icon amber">!</b><div><span>Entradas sin salida</span><strong id="statRevision">0</strong><small id="periodEntradasOpen">Mes actual</small></div></article><article class="kpi"><b class="kpi-icon red">↗</b><div><span>Salidas sin entrada</span><strong id="statOcr">0</strong><small id="periodSalidasOpen">Mes actual</small></div></article><article class="kpi"><b class="kpi-icon violet">⌁</b><div><span>Revisión pendiente</span><strong id="statPending">0</strong><small id="periodPending">Mes actual</small></div></article></section>
-<section class="workspace-card" id="historial"><div class="section-head"><div><h2>Visitas y eventos</h2><p>Historial completo de accesos, salidas y eventos del sistema.</p></div><div class="section-actions"><label class="search">⌕ <input id="globalSearch" placeholder="Buscar placa, habitación o ID"></label><button id="btnExport" class="btn-secondary" type="button">Exportar Excel</button></div></div><div class="tabs"><button class="tab active" data-tab="all" type="button">Todos</button><button class="tab" data-tab="visits" type="button">Visitas</button><button class="tab" data-tab="entries" type="button">Entradas</button><button class="tab" data-tab="exits" type="button">Salidas</button><button class="tab" data-tab="pending" type="button">Pendientes <b id="pendingBadge">0</b></button></div><form id="filterForm" class="filters"><input id="filterPlate" placeholder="Placa"><select id="filterCamera"><option value="">Cámara</option><option value="A1">A1 · Entrada</option><option value="A5">A5 · Salida</option></select><input id="filterDateFrom" type="date"><input id="filterDateTo" type="date"><select id="filterType"><option value="">Movimiento</option><option value="INWARD">Entrada</option><option value="OUTWARD">Salida</option></select><input id="filterRoom" type="number" placeholder="Habitación"><select id="filterReview"><option value="">Estado</option><option value="true">Requiere revisión</option><option value="false">Revisado</option></select><button class="btn-primary" type="submit">Filtrar</button><button id="clearFilters" class="btn-ghost" type="button">Limpiar</button></form><div class="table-wrap"><table><thead><tr><th>Fecha / hora</th><th>Cámara</th><th>Movimiento</th><th>Placa</th><th>Habitación</th><th>Estado</th><th>Evidencia</th><th>Acciones</th></tr></thead><tbody id="eventsTable"><tr><td colspan="8" class="empty">Cargando historial...</td></tr></tbody></table></div><div class="table-foot"><span id="eventsMeta">Cargando...</span><button id="btnPrevPage" class="btn-ghost" disabled>←</button><span id="pageIndicator">1 / 1</span><button id="btnNextPage" class="btn-ghost" disabled>→</button></div></section>
-<aside class="side-panels"><section class="panel" id="associationPanel"><div class="panel-head"><h2>🔗 Asociar entrada ↔ salida</h2><p>Selecciona una salida para completar la visita.</p></div><div id="associationEmpty" class="panel-empty">Selecciona una entrada para comenzar.</div><div id="associationContent" class="hidden"><div id="selectedEntry"></div><h3>Salidas sugeridas <small>(máximo 5)</small></h3><div id="availableExits"></div><p id="associationMessage" class="inline-message"></p><button id="confirmAssociation" class="btn-primary full" type="button" disabled>✓ Completar visita</button></div></section><section class="panel" id="correctionPanel"><div class="panel-head"><h2>✏ Corrección manual de placa</h2><p>Conserva el valor OCR original.</p></div><div id="correctionEmpty" class="panel-empty">Selecciona un evento para editarlo.</div><form id="correctionForm" class="hidden"><input id="modalEventId" type="hidden"><label>Placa detectada (OCR)<strong id="modalPlateOriginal">—</strong></label><label>Placa corregida<input id="modalPlate" maxlength="64" required></label><button id="btnSaveCorrection" class="btn-primary full" type="submit">Guardar corrección</button><p id="correctionMessage" class="inline-message"></p></form></section></aside>
-<section class="camera-section" id="camaras"><div class="section-head"><div><h2>Monitoreo en tiempo real</h2><p>Estado de cámaras y últimas imágenes.</p></div></div><div class="camera-grid"><article class="camera-compact"><div class="camera-title"><h3>Cámara A1 <small>Entrada</small></h3><span id="camA1_state" class="status-pill">Desconectado</span></div><div class="camera-body"><div class="snapshot"><img id="camA1_img" alt="Último frame A1"><span id="camA1_overlay" class="snapshot-overlay">SIN IMAGEN</span></div><dl><div><dt>Captura</dt><dd id="camA1_cap">0 FPS</dd></div><div><dt>Inferencia</dt><dd id="camA1_inf">0 FPS</dd></div><div><dt>Tracks</dt><dd id="camA1_tracks">0</dd></div></dl></div></article><article class="camera-compact"><div class="camera-title"><h3>Cámara A5 <small>Salida</small></h3><span id="camA5_state" class="status-pill">Desconectado</span></div><div class="camera-body"><div class="snapshot"><img id="camA5_img" alt="Último frame A5"><span id="camA5_overlay" class="snapshot-overlay">SIN IMAGEN</span></div><dl><div><dt>Captura</dt><dd id="camA5_cap">0 FPS</dd></div><div><dt>Inferencia</dt><dd id="camA5_inf">0 FPS</dd></div><div><dt>Tracks</dt><dd id="camA5_tracks">0</dd></div></dl></div></article></div></section></main>
-<div id="correctionModal" class="modal-overlay hidden"><div class="modal-card"><button id="btnCloseModal" class="modal-close">×</button><h2>Detalle del evento</h2><div id="modalAuditLogs"></div><button id="btnCancelCorrection" class="btn-ghost" type="button">Cerrar</button></div></div><div id="videoModal" class="modal-overlay hidden"><div class="modal-card"><button id="btnCloseVideoModal" class="modal-close">×</button><h2 id="videoModalTitle">Evidencia</h2><video id="evidenceVideo" controls width="100%"></video></div></div><div id="operationMessage" role="status"></div><script src="/static/app.js"></script></body></html>
-<div id="associationModal" class="hidden" aria-hidden="true"></div>
+<html lang="es">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width,initial-scale=1" />
+    <title>Control vehicular · Hotel Relax</title>
+    <link rel="stylesheet" href="/static/dashboard.css" />
+  </head>
+  <body>
+    <a class="skip" href="#main">Ir al contenido</a>
+    <header>
+      <a class="brand" href="#control"><b>HR</b> Hotel Relax</a>
+      <nav aria-label="Navegación principal">
+        <a href="#control">Control</a><a href="#historial">Historial</a><a href="#reportes">Reportes</a
+        ><a href="#camaras">Cámaras</a><a href="#configuracion">Configuración</a>
+      </nav>
+      <span id="userGreeting"></span><button id="logoutBtn">Cerrar sesión</button>
+    </header>
+    <main id="main">
+      <div class="headline">
+        <div>
+          <small>Hotel Relax · Latacunga</small>
+          <h1 id="title">Control vehicular</h1>
+        </div>
+        <span id="detectorStatus" role="status">Consultando detector…</span>
+      </div>
+      <p id="operationMessage" role="status"></p>
+      <section id="overview">
+        <div class="section-head">
+          <h2>Resumen de visitas</h2>
+          <label>Periodo <input type="month" id="monthPicker" /></label>
+        </div>
+        <div class="cards">
+          <button data-category="visits_completed">
+            Visitas completadas<strong id="statVisitasActivas">—</strong>
+          </button>
+          <button data-category="entries_unpaired">
+            Entradas sin salida<strong id="statEntradas">—</strong>
+          </button>
+          <button data-category="exits_unpaired">
+            Salidas sin entrada<strong id="statSalidas">—</strong>
+          </button>
+          <button data-category="review_pending">
+            Revisión pendiente<strong id="statPending">—</strong>
+          </button>
+        </div>
+      </section>
+      <section id="history">
+        <div class="section-head">
+          <h2 id="listTitle">Historial de visitas</h2>
+          <a id="historyLink" href="#historial">Abrir historial</a>
+        </div>
+        <form id="filterForm" class="filters">
+          <label>Buscar<input name="q" type="search" placeholder="ID, placa o habitación" /></label>
+          <label>Mes<input id="historyMonth" type="month" /></label>
+          <label>Desde<input name="date_from" type="date" /></label
+          ><label>Hasta<input name="date_to" type="date" /></label>
+          <label>Estado<select name="state" class="states"></select></label
+          ><label
+            >Cámara<select name="camera">
+              <option value="">Todas</option>
+              <option>A1</option>
+              <option>A5</option>
+            </select></label
+          >
+          <label>Habitación<input name="room" type="number" min="1" /></label
+          ><label>Placa<input name="plate" maxlength="64" /></label>
+          <label
+            >Orden<select name="order">
+              <option value="desc">Más reciente</option>
+              <option value="asc">Más antigua</option>
+            </select></label
+          >
+          <button class="primary">Filtrar</button><button type="button" id="clearFilters">Limpiar</button>
+        </form>
+        <div class="scroll">
+          <table>
+            <caption class="sr">
+              Visitas en el periodo seleccionado
+            </caption>
+            <thead>
+              <tr>
+                <th>Fecha y procedencia</th>
+                <th>Cámara</th>
+                <th>Placa</th>
+                <th>Habitación</th>
+                <th>Estado</th>
+                <th>Acciones</th>
+              </tr>
+            </thead>
+            <tbody id="eventsTable"></tbody>
+          </table>
+        </div>
+        <div class="foot">
+          <span id="eventsMeta" role="status"></span
+          ><button id="btnPrevPage" aria-label="Página anterior">←</button><span id="pageIndicator"></span
+          ><button id="btnNextPage" aria-label="Página siguiente">→</button>
+        </div>
+      </section>
+      <section id="reports" hidden>
+        <h2>Exportar visitas</h2>
+        <form id="reportForm" class="filters">
+          <label>Mes<input type="month" name="month" /></label
+          ><label>Desde<input type="date" name="date_from" /></label
+          ><label>Hasta<input type="date" name="date_to" /></label
+          ><label>Estado<select name="state" class="states"></select></label
+          ><button class="primary">Generar Excel</button>
+        </form>
+        <p id="reportStatus" role="status"></p>
+        <a hidden id="download" download="visitas.xlsx">Descargar Excel generado</a>
+      </section>
+      <section id="cameras" hidden>
+        <h2>Estado de captura</h2>
+        <div id="cameraGrid"></div>
+      </section>
+      <section id="settings" hidden>
+        <h2>Preferencias del dashboard</h2>
+        <p>Zona horaria · America/Guayaquil (solo lectura)</p>
+        <p id="readOnlySettings"></p>
+        <p>Las credenciales y los parámetros del detector se administran en el servidor.</p>
+        <form id="settingsForm" class="filters">
+          <label
+            >Visitas por página<input
+              id="pageSize"
+              disabled
+              required
+              type="number"
+              min="1"
+              max="100" /></label
+          ><button class="primary" hidden>Guardar cambios</button>
+        </form>
+        <p id="settingStatus" role="status"></p>
+        <div id="revisions"></div>
+      </section>
+    </main>
+    <dialog id="associationModal" aria-labelledby="associationTitle">
+      <h2 id="associationTitle">Asociar salida</h2>
+      <p id="selectedEntry"></p>
+      <form id="associationForm">
+        <div id="availableExits"></div>
+        <p id="associationMessage" role="status"></p>
+        <button id="confirmAssociation" class="primary">Completar visita</button>
+        <button type="button" data-close>Cancelar</button>
+      </form>
+    </dialog>
+    <dialog id="editor" aria-labelledby="editorTitle">
+      <h2 id="editorTitle"></h2>
+      <form id="correctionForm">
+        <p>Lectura original · <strong id="modalPlateOriginal"></strong></p>
+        <label id="editLabel" for="modalPlate">Placa corregida</label><input id="modalPlate" required />
+        <p id="correctionMessage" role="status"></p>
+        <button id="btnSaveCorrection" class="primary">Guardar corrección</button>
+        <button type="button" data-close>Cerrar</button>
+      </form>
+    </dialog>
+    <dialog id="correctionModal" aria-labelledby="detailTitle">
+      <div class="section-head">
+        <h2 id="detailTitle">Detalle de visita</h2>
+        <button id="btnCloseModal" data-close>Cerrar</button>
+      </div>
+      <div id="modalAuditLogs"></div>
+    </dialog>
+    <script src="/static/app.js"></script>
+  </body>
+</html>

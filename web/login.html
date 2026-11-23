@@ -22,7 +22,7 @@
           <label for="loginPassword">Contraseña</label>
           <div class="password-row">
             <input id="loginPassword" name="password" type="password" autocomplete="current-password" required>
-            <button id="togglePassword" type="button" aria-label="Mostrar u ocultar contraseña">Mostrar</button>
+            <button id="togglePassword" type="button" aria-pressed="false" aria-label="Mostrar u ocultar contraseña">Mostrar</button>
           </div>
         </div>
         <div id="loginError" class="login-error" role="status" aria-live="polite"></div>
@@ -39,8 +39,10 @@
     const submit = document.getElementById("loginSubmit");
     const errorBox = document.getElementById("loginError");
     const password = document.getElementById("loginPassword");
-    document.getElementById("togglePassword").addEventListener("click", () => {
+    document.getElementById("togglePassword").addEventListener("click", (event) => {
       password.type = password.type === "password" ? "text" : "password";
+      event.currentTarget.textContent = password.type === "text" ? "Ocultar" : "Mostrar";
+      event.currentTarget.setAttribute("aria-pressed", String(password.type === "text"));
     });
     form.addEventListener("submit", async (event) => {
       event.preventDefault();
