@@ -4,6 +4,8 @@ Deteccion_Carros — OCR (Reconocimiento Óptico de Caracteres)
 Lectura robusta de placas vehiculares usando EasyOCR en CPU con localización por niveles y preprocesamiento múltiple.
 """
 
+import logging
+import time
 import re
 from typing import Optional
 
@@ -39,102 +41,64 @@ class PlateReader:
         """Inicializa EasyOCR en CPU."""
         try:
             import easyocr
-        except ImportError:
-            print("[OCR] EasyOCR no está instalado. OCR desactivado.")
+            self.reader = easyocr.Reader(self.languages, gpu=False)
+        except Exception as exc:
             self.enabled = False
-            return
-
-        self.reader = easyocr.Reader(self.languages, gpu=False)
-        print(f"[OCR] EasyOCR inicializado en CPU. Idiomas: {self.languages}")
+            logging.getLogger(__name__).warning("ocr_init status=MOTOR_NO_DISPONIBLE error=%s", type(exc).__name__)
 
     def read(self, vehicle_image: np.ndarray) -> Optional[dict]:
-        """
-        Intenta leer una placa desde la imagen recortada del vehículo (API clásica).
+        """Contrato clásico para consumidores que esperan una placa completa."""
+        eligible = [item for item in self.read_all_candidates(vehicle_image)
+                    if item["format"] == "COMPLETO" and item["confidence"] >= self.min_confidence]
+        if eligible:
+            best = max(eligible, key=lambda item: item["confidence"])
+            return {"plate": best["plate"], "confidence": best["confidence"]}
+        return None
 
-        Returns:
-            {"plate": "ABC1234", "confidence": 0.82} o None.
-        """
-        candidates = self.read_all_candidates(vehicle_image)
-        if not candidates:
-            return None
-        candidates.sort(key=lambda x: x["confidence"], reverse=True)
-        return {
-            "plate": candidates[0]["plate"],
-            "confidence": candidates[0]["confidence"]
-        }
+    def read_all_candidates(self, vehicle_image, frame_id=None):
+        return self.inspect_frame(vehicle_image, frame_id)[0]
 
-    def read_all_candidates(self, vehicle_image: np.ndarray, frame_id=None) -> list[dict]:
-        """
-        Busca todas las posibles placas válidas aplicando localización multinivel
-        y variantes de preprocesamiento.
-        """
-        if not self.enabled or self.reader is None or vehicle_image is None or vehicle_image.size == 0:
-            return []
-
-        h, w = vehicle_image.shape[:2]
-        crops = []
-
-        # Nivel 4: Imagen completa (fallback)
-        crops.append(("full", vehicle_image))
-
-        # Nivel 1: Mitad inferior
-        if h > 40:
-            crops.append(("bottom", vehicle_image[h // 2 :, :]))
-
-        # Nivel 2: Mitad inferior central
-        if h > 40 and w > 50:
-            crops.append(("bottom_center", vehicle_image[h // 2 :, w // 5 : 4 * w // 5]))
-
-        # Nivel 3: Recortes basados en contornos rectangulares
-        contour_crops = self._get_contour_crops(vehicle_image)
-        for i, cc in enumerate(contour_crops[:3]):  # Limitar a los mejores 3 contornos
-            crops.append((f"contour_{i}", cc))
-
+    def inspect_frame(self, vehicle_image, frame_id=None):
+        """Devuelve hipótesis y métricas. Las coordenadas se refieren al recorte vehicular."""
         found = []
-        seen = set()
-
-        for label, crop in crops:
-            if crop.size == 0 or crop.shape[0] < 8 or crop.shape[1] < 15:
-                continue
-
-            variants = self._get_preprocessing_variants(crop)
-            for v_name, prep_img in variants:
-                try:
-                    results = self.reader.readtext(prep_img, detail=1, paragraph=False)
-                    for res in results:
-                        if len(res) < 3:
-                            continue
-                        _bbox, text, confidence = res
-                        confidence = float(confidence)
-                        if confidence < self.min_confidence:
-                            continue
-
-                        plate = self.clean_text(text)
-                        if self.is_valid_ecuador_plate(plate):
-                            key = (plate, label, v_name)
-                            if key not in seen:
-                                seen.add(key)
-                                found.append({
-                                    "plate": plate,
-                                    "confidence": confidence,
-                                    "crop_label": label,
-                                    "variant": v_name,
-                                    "frame_id": frame_id
-                                })
-                except Exception:
-                    pass
-        return found
-
-    def _get_contour_crops(self, image: np.ndarray) -> list[np.ndarray]:
-        crops = []
+        metrics = dict(crops=0, engine_calls=0, errors=0, locate_ms=0., preprocess_ms=0., engine_ms=0.)
+        if not self.enabled or self.reader is None:
+            return found, dict(metrics, engine_status="MOTOR_NO_DISPONIBLE")
+        start = time.perf_counter()
         try:
-            for candidate in locate_plate_candidates(image):
-                if candidate["crop_type"].startswith("contour"):
-                    x1, y1, x2, y2 = candidate["crop_bbox"]
-                    crops.append(image[y1:y2, x1:x2].copy())
-        except Exception:
-            pass
-        return crops
+            regions = locate_plate_candidates(vehicle_image, max_candidates=6, diagnostics=metrics)
+        except (ValueError, cv2.error):
+            return found, dict(metrics, errors=1, engine_status="ERROR_OCR")
+        metrics["locate_ms"] = (time.perf_counter() - start) * 1000
+        for region in regions:
+            x, y, right, bottom = region["crop_bbox"]
+            crop = vehicle_image[y:bottom, x:right]
+            start = time.perf_counter()
+            variants = self._get_preprocessing_variants(crop)
+            metrics["preprocess_ms"] += (time.perf_counter() - start) * 1000
+            metrics["crops"] += 1
+            if len(variants) < 3:
+                metrics["errors"] += 1
+            for variant, image in variants:
+                start = time.perf_counter()
+                metrics["engine_calls"] += 1
+                try:
+                    results = self.reader.readtext(image, detail=1, paragraph=False)
+                    for polygon, text, confidence in results:
+                        normalized = self.clean_text(text)
+                        points = [[x + float(px) * crop.shape[1] / image.shape[1],
+                                   y + float(py) * crop.shape[0] / image.shape[0]] for px, py in polygon]
+                        found.append(dict(raw_text=text, plate=normalized, confidence=float(confidence),
+                                          format="COMPLETO" if self.is_valid_ecuador_plate(re.sub(r"[\s-]", "", text.upper())) else "INCOMPLETO",
+                                          crop_label=region["crop_type"], crop_quality=region["crop_quality"],
+                                          crop_bbox=region["crop_bbox"], text_polygon=points,
+                                          variant=variant, frame_id=frame_id))
+                except Exception:
+                    metrics["errors"] += 1
+                finally:
+                    metrics["engine_ms"] += (time.perf_counter() - start) * 1000
+        state = "ERROR_OCR" if metrics["errors"] else "OK" if regions else "SIN_CANDIDATO"
+        return found, dict(metrics, engine_status=state)
 
     def _get_preprocessing_variants(self, crop: np.ndarray) -> list[tuple[str, np.ndarray]]:
         variants = []
@@ -196,7 +160,7 @@ class PlateReader:
         return bool(cls.ECUADOR_PLATE_PATTERN.match(text))
 
 
-def locate_plate_candidates(vehicle_crop: np.ndarray, max_candidates: int = 3) -> list[dict]:
+def locate_plate_candidates(vehicle_crop: np.ndarray, max_candidates: int = 3, *, diagnostics=None) -> list[dict]:
     """
     Localizador CPU ligero de regiones candidatas de placa dentro de un recorte vehicular.
 
@@ -255,8 +219,9 @@ def locate_plate_candidates(vehicle_crop: np.ndarray, max_candidates: int = 3) -
         contour_candidates.sort(reverse=True)
         for index, (_area, bbox) in enumerate(contour_candidates[:max_candidates]):
             add_candidate(f"contour_{index}", bbox, 0.55)
-    except Exception:
-        pass
+    except (cv2.error, ValueError):
+        if diagnostics is not None:
+            diagnostics["errors"] += 1
 
     add_candidate("full_vehicle", (0, 0, width, height), 0.15)
     candidates.sort(key=lambda item: item["crop_quality"], reverse=True)

@@ -39,7 +39,7 @@ def vote_plate(candidates: list[dict], min_confidence: float = 0.55) -> dict:
     return result
 
 
-def vote_plates_multiframe(candidates: list[dict[str, Any]]) -> dict[str, Any]:
+def vote_plates_multiframe(candidates: list[dict[str, Any]], *, observed_only=False) -> dict[str, Any]:
     """
     Votacion estricta por frames fisicos.
 
@@ -48,8 +48,23 @@ def vote_plates_multiframe(candidates: list[dict[str, Any]]) -> dict[str, Any]:
     cuentan como consenso temporal independiente.
     """
     normalized = [_normalize_candidate(candidate, index) for index, candidate in enumerate(candidates)]
+    if observed_only:
+        for source, item in zip(candidates, normalized):
+            if source.get("frame_id") is None:
+                item["frame_id"] = "unknown_frame"
+            observed = item["sanitized_text"]
+            item.update(plate=observed, normalized_text=observed,
+                        valid_format=bool(PLATE_PATTERN.fullmatch(observed)) and
+                        bool(re.fullmatch(r"[A-Za-z0-9\s-]+", item["raw_text"])))
     valid = [candidate for candidate in normalized if candidate["valid_format"]]
 
+    if observed_only and not valid and normalized:
+        useful = [c for c in normalized if c["sanitized_text"]]
+        if useful:
+            best = max(useful, key=_candidate_weight)
+            return _result(partial_text=best["raw_text"], plate=None, confidence=_candidate_weight(best), status="PARCIAL",
+                           candidates=normalized, supporting_frame_ids=(best["frame_id"],),
+                           review_reasons=("incomplete_observation",))
     if not valid:
         return _result(
             plate=None,
@@ -88,7 +103,10 @@ def vote_plates_multiframe(candidates: list[dict[str, Any]]) -> dict[str, Any]:
     for plate, by_frame in grouped.items():
         frame_votes = list(by_frame.values())
         weights = [vote["_weight"] for vote in frame_votes]
-        combined = sum(weights) / max(1, len(weights))
+        combined = sum(weights) / len(weights)
+        if observed_only:
+            # Discount single-frame hypotheses when competing with repeated observations.
+            combined *= 1.0 if len(weights) >= 2 else 0.90
         scored.append(
             {
                 "plate": plate,
@@ -108,9 +126,11 @@ def vote_plates_multiframe(candidates: list[dict[str, Any]]) -> dict[str, Any]:
     contradiction = runner is not None and runner_score >= 0.40 and vote_margin < 0.15
     review_reasons: list[str] = []
 
-    if unique_frames >= 2 and winner["score"] >= 0.65 and vote_margin >= 0.15 and not contradiction:
+    strong_frames = sum(v["_weight"] >= 0.55 for v in winner["frame_votes"])
+    if unique_frames >= 2 and (not observed_only or strong_frames >= 2) and winner["score"] >= 0.65 and vote_margin >= 0.15 and not contradiction:
         status = "LEIDA"
         review_required = False
+        review_reasons.append("independent_exact_agreement")
     elif winner["score"] >= 0.40:
         status = "PROBABLE"
         review_required = True
@@ -120,6 +140,10 @@ def vote_plates_multiframe(candidates: list[dict[str, Any]]) -> dict[str, Any]:
             review_reasons.append("weak_vote_margin")
         if contradiction:
             review_reasons.append("contradictory_candidates")
+    elif observed_only:
+        status = "PROBABLE"
+        review_required = True
+        review_reasons.append("low_confidence")
     else:
         status = "NO_LEGIBLE"
         review_required = True
@@ -196,6 +220,7 @@ def _result(
     confidence: float,
     status: str,
     candidates: list[dict[str, Any]],
+    partial_text: str | None = None,
     runner_up_plate: str | None = None,
     runner_up_confidence: float = 0.0,
     vote_margin: float = 0.0,
@@ -208,6 +233,7 @@ def _result(
     return {
         "plate": plate,
         "plate_text": plate,
+        "partial_text": partial_text,
         "confidence": confidence,
         "plate_confidence": confidence,
         "status": status,
