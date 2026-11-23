@@ -12,6 +12,7 @@ import sys
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 from app import config
+from app.hotel import visits
 from app.hotel.store import HotelStore
 
 
@@ -106,6 +107,7 @@ def migrate(legacy_path=None, hotel_path=None, backup_dir=None):
                  event_type, plate, float(row["confianza_ocr"] or 0), status, "[]", None,
                  0.0, "NO_DETERMINADA", "legacy", 0.0, row["imagen"], 1,
                  note, "DISABLED", "legacy_eventos", source_id))
+            visits.ingest(target,event_id,historical=True)
             inserted += 1
         target.commit()
     except Exception:
