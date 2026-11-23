@@ -32,6 +32,7 @@ from app.export.excel_exporter import HotelExcelExporter
 from app.runtime import is_valid_jpeg, runtime_snapshot_path, snapshot_info, validate_runtime_camera
 from app.hotel import visits as canonical
 from app import administration as admin
+from app import visit_dashboard as visit_queries
 from contextlib import asynccontextmanager
 from fastapi.responses import RedirectResponse
 from pydantic import BaseModel, Field
@@ -116,7 +117,7 @@ app.mount("/static", StaticFiles(directory=str(WEB_DIR)), name="static")
 def web_page(filename: str):
     """Bind each HTML response to the exact asset contents, including through proxies."""
     html = (WEB_DIR / filename).read_text(encoding='utf-8')
-    for asset in ('app.js', 'style.css'):
+    for asset in ('app.js', 'style.css', 'dashboard.css'):
         version = hashlib.sha256((WEB_DIR / asset).read_bytes()).hexdigest()[:16]
         html = html.replace(f'/static/{asset}"', f'/static/{asset}?v={version}"')
     return HTMLResponse(html)
@@ -476,27 +477,118 @@ def canonical_item(c, row):
 
 @app.get("/api/hotel/visit-cases")
 def visit_cases(
-    category: Optional[str] = None,
-    month: Optional[str] = None,
-    page: int = Query(1, ge=1),
-    page_size: int = Query(25, ge=1, le=100),
-    authenticated: dict = Depends(check_auth),
+    filters: Annotated[visit_queries.HistoryFilters, Query()], authenticated: dict = Depends(check_auth)
 ):
-    sql, args = manual_operation(canonical.query, category, month)
+    sql, args = manual_operation(visit_queries.selection, filters)
     with admin.connection() as c:
         c.execute("BEGIN")
         total = c.execute("SELECT count(*)" + sql, args).fetchone()[0]
-        rows = c.execute(
-            "SELECT *" + sql + " ORDER BY instant DESC,id LIMIT ? OFFSET ?",
-            [*args, page_size, (page - 1) * page_size],
+        result = visit_queries.rows(c, filters, filters.page_size, (filters.page - 1) * filters.page_size)
+        return dict(
+            visits=[
+                dict(
+                    r,
+                    identification_status="CORREGIDA_MANUALMENTE" if r["plate_manual"] else r["plate_status"],
+                )
+                for r in result
+            ],
+            total=total,
+            page=filters.page,
+            page_size=filters.page_size,
         )
-        items = [
-            canonical_item(c, canonical.case(c, r["id"]) if category == "review_pending" else r)
-            if r["kind"] != "room_review"
-            else dict(r, state="HABITACION_SIN_ASIGNAR")
-            for r in rows
-        ]
-        return dict(visits=items, total=total, page=page, page_size=page_size)
+
+
+@app.post("/api/hotel/reports/visits")
+def visit_report(filters: visit_queries.Filters, authenticated: dict = Depends(check_auth)):
+    with admin.connection() as c:
+        c.execute("BEGIN")
+        data, count = manual_operation(visit_queries.excel, c, filters)
+    return Response(
+        data,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": 'attachment; filename="visitas.xlsx"', "X-Visit-Count": str(count)},
+    )
+
+
+def ocr_detail(raw):
+    try:
+        data = json.loads(raw or "{}")
+    except (TypeError, ValueError):
+        data = {}
+    if not isinstance(data, dict):
+        data = {}
+    frames = data.get("frames")
+    return data.get("engine_status"), [f if isinstance(f, dict) else {} for f in frames] if isinstance(
+        frames, list
+    ) else []
+
+
+def event_media(ev):
+    from urllib.parse import quote
+
+    prefix = "/api/hotel/evidence/" + quote(ev["event_id"], safe="") + "/"
+    engine, raw_frames = ocr_detail(ev.get("ocr_diagnostics_json"))
+    frames = [
+        dict(
+            frame_id=f.get("frame_id"),
+            captured_at=f.get("captured_at"),
+            evidence_url=prefix + str(i) if f.get("evidence_path") else None,
+        )
+        for i, f in enumerate(raw_frames)
+    ]
+    fields = (
+        "event_id",
+        "event_type",
+        "occurred_at",
+        "camera_id",
+        "plate_status",
+        "verification_status",
+        "plate",
+        "plate_manual",
+        "plate_original",
+        "plate_confidence",
+        "plate_candidates",
+    )
+    return {
+        **{k: ev.get(k) for k in fields},
+        "evidence_url": prefix + "photo" if ev["evidence_path"] else None,
+        "clip_url": prefix + "clip" if ev["clip_path"] else None,
+        "ocr_diagnostics": {"engine_status": engine, "frames": frames},
+    }
+
+
+@app.get("/api/hotel/evidence/{key}/{part}")
+def visit_media(key: str, part: str, authenticated: dict = Depends(check_auth)):
+    with admin.connection() as c:
+        if part == "room":
+            row = c.execute("SELECT evidence_path FROM visit_rooms WHERE id=?", (key,)).fetchone()
+            path = row[0] if row else None
+        else:
+            e = manual_operation(admin.event, c, key)
+            if part in ("photo", "clip"):
+                path = e["clip_path" if part == "clip" else "evidence_path"]
+            else:
+                _, frames = ocr_detail(e["ocr_diagnostics_json"])
+                path = (
+                    frames[int(part)].get("evidence_path")
+                    if part.isascii() and part.isdecimal() and len(part) < 8 and int(part) < len(frames)
+                    else None
+                )
+    if not path:
+        raise HTTPException(404, "Evidencia no disponible")
+    root = Path(config.BASE_DIR) / "data/clips" if part == "clip" else Path(config.CAPTURE_DIR)
+    target = Path(path).resolve()
+    _verify_path_safe(root.resolve(), target)
+    return FileResponse(target, media_type="video/mp4" if part == "clip" else "image/jpeg")
+
+
+def room_detail(row, anchor=None):
+    data = dict(row)
+    path = data.pop("evidence_path", None)
+    data["evidence_url"] = (
+        f"/api/hotel/evidence/{row['id']}/room" if path else anchor if row["evidence_event"] else None
+    )
+    return data
 
 
 @app.get("/api/hotel/visit-cases/{key}")
@@ -516,20 +608,16 @@ def visit_case(key: str, authenticated: dict = Depends(check_auth)):
             return dict(
                 id=key,
                 state="HABITACION_SIN_ASIGNAR",
-                rooms=[dict(x, evidence_url=_relative_evidence_url(x["evidence_path"])) for x in rooms],
+                rooms=[room_detail(x) for x in rooms],
             )
         r = manual_operation(canonical.case, c, key)
         item = canonical_item(c, r)
         ids = list(dict.fromkeys(x for x in (key, r["exit_event_id"]) if x))
-        item["events"] = [enrich_event(admin.event(c, x)) for x in ids]
-        anchor_evidence = item["evidence_path"]
+        item["events"] = [event_media(admin.event(c, x)) for x in ids]
+        item.pop("evidence_path", None)
+        anchor_evidence = item["events"][0]["evidence_url"]
         item["rooms"] = [
-            dict(
-                x,
-                evidence_url=_relative_evidence_url(
-                    x["evidence_path"] or (anchor_evidence if x["evidence_event"] == key else None)
-                ),
-            )
+            room_detail(x, anchor_evidence)
             for x in c.execute("SELECT * FROM visit_rooms WHERE visit_id=? ORDER BY instant,id", (key,))
         ]
         item["history"] = [
@@ -668,7 +756,7 @@ def download_excel(authenticated: bool = Depends(check_auth)):
 
 
 @app.get("/api/hotel/cameras/{camera_id}/snapshot")
-def get_camera_snapshot(camera_id: str, authenticated: bool = Depends(check_auth)):
+def get_camera_snapshot(camera_id: str, authenticated: bool = Depends(check_auth), allow_stale: bool = False):
     """Servicio para retornar la imagen en tiempo real capturada por el detector."""
     try:
         validate_runtime_camera(camera_id)
@@ -680,13 +768,14 @@ def get_camera_snapshot(camera_id: str, authenticated: bool = Depends(check_auth
     info = snapshot_info(camera_id)
     if not info.available or not is_valid_jpeg(target):
         raise HTTPException(status_code=404, detail="Snapshot inválido.")
-    if info.stale:
+    if info.stale and not allow_stale:
         raise HTTPException(status_code=503, detail="Snapshot desactualizado.")
     return FileResponse(
         target,
         media_type="image/jpeg",
         headers={
             "Cache-Control": "no-store, no-cache, must-revalidate",
+            "X-Snapshot-Stale": str(info.stale).lower(),
             "Last-Modified": datetime.fromtimestamp(target.stat().st_mtime).strftime("%a, %d %b %Y %H:%M:%S GMT"),
         },
     )
@@ -735,3 +824,116 @@ def _relative_clip_url(clip_path: Optional[str]) -> str:
         return ""
     relative = os.path.relpath(abs_path, abs_clips_dir).replace(os.sep, "/")
     return f"/media/clips/{relative}"
+
+
+@app.post("/api/hotel/visit-cases/{key}/flag")
+def flag_visit(key: str, authenticated: dict = Depends(check_auth), token: CommandKey = None):
+    def flag(c, key, actor):
+        if not canonical.case(c, key)["pending"]:
+            c.execute("UPDATE visit_cases SET review=1 WHERE id=?", (key,))
+            canonical.record(c, key, "REVISION_SOLICITADA", actor)
+
+    return case_write(authenticated["id"], flag, key, authenticated["id"], token=token)
+
+
+class DisplaySettings(BaseModel):
+    model_config = {"extra": "forbid"}
+    page_size: int = Field(ge=1, le=100, strict=True)
+    revision: int = Field(ge=0)
+
+
+@app.get("/api/hotel/display-settings")
+def display_settings(authenticated: dict = Depends(check_auth)):
+    with admin.connection() as c:
+        row = c.execute("SELECT id,page_size FROM display_settings ORDER BY id DESC LIMIT 1").fetchone()
+        history = c.execute(
+            "SELECT id,page_size,changed_at FROM display_settings ORDER BY id DESC LIMIT 20"
+        ).fetchall()
+    return dict(
+        page_size=row["page_size"] if row else 20,
+        revision=row["id"] if row else 0,
+        timezone=str(canonical.ZONE),
+        association_seconds=canonical.window(),
+        track_seconds=canonical.window("HOTEL_VISIT_TRACK_MAX_SECONDS", 120),
+        editable=authenticated["role"] == "admin",
+        history=[dict(r) for r in history],
+    )
+
+
+@app.patch("/api/hotel/display-settings")
+def save_display_settings(payload: DisplaySettings, authenticated: dict = Depends(check_auth)):
+    if authenticated["role"] != "admin":
+        raise HTTPException(403, "Requiere administración")
+    with admin.connection() as c, c:
+        c.execute("BEGIN IMMEDIATE")
+        previous = c.execute("SELECT id,page_size FROM display_settings ORDER BY id DESC LIMIT 1").fetchone()
+        if payload.revision != (previous[0] if previous else 0):
+            raise HTTPException(409, "La configuración cambió. Recarga antes de editar.")
+        c.execute(
+            "INSERT INTO display_settings(page_size,actor) VALUES(?,?)",
+            (payload.page_size, authenticated["id"]),
+        )
+        admin.audit(
+            c,
+            authenticated["id"],
+            "DISPLAY_SETTINGS_CHANGED",
+            "settings",
+            "page_size",
+            previous[1] if previous else 20,
+            payload.page_size,
+        )
+    return display_settings(authenticated)
+
+
+@app.get("/api/hotel/monitor")
+def monitor(authenticated: dict = Depends(check_auth)):
+    status = get_hotel_status(authenticated)
+    path = Path(config.BASE_DIR) / "data/runtime/hotel_status.json"
+    updated = path.stat().st_mtime if path.is_file() else 0
+    if status.get("updated_at"):
+        try:
+            updated = min(updated, datetime.fromisoformat(status["updated_at"]).timestamp())
+        except (TypeError, ValueError):
+            updated = 0
+    fresh = 0 <= time.time() - updated <= 30
+    running = bool(fresh and status.get("running"))
+    cams = {}
+    for camera in ("A1", "A5"):
+        c = status.get("cameras", {}).get(camera, {})
+        snap = snapshot_info(camera)
+        with admin.connection() as conn:
+            last = conn.execute(
+                """SELECT plate_status,occurred_at, CASE WHEN json_valid(ocr_diagnostics_json)
+                   THEN json_extract(ocr_diagnostics_json,'$.engine_status') END engine_status
+                   FROM hotel_vehicle_events WHERE camera_id=? ORDER BY occurred_at DESC LIMIT 1""",
+                (camera,),
+            ).fetchone()
+        cams[camera] = {
+            "last_reading": dict(last) if last else None,
+            **{k: c.get(k) for k in ("capture_fps", "inference_fps", "geometry_configured", "geometry_features")},
+            "connected": running and bool(c.get("connected")),
+            "error": bool(c.get("last_error")),
+            "snapshot": snap.__dict__,
+        }
+    return dict(
+        running=running,
+        updated_at=updated or None,
+        cameras=cams,
+        ocr_counts=status.get("ocr_session_counts") if fresh else None,
+    )
+
+
+@app.get("/api/hotel/visit-cases/{key}/available-exits")
+def available_exits(key: str, page: int = Query(1, ge=1), authenticated: dict = Depends(check_auth)):
+    with admin.connection() as c:
+        c.execute("BEGIN")
+        entry = manual_operation(canonical.case, c, key)
+        if entry["kind"] != "entry" or entry["exit_event_id"] or entry["exceptional_reason"]:
+            raise HTTPException(409, "La entrada ya no está disponible")
+        rows = c.execute(
+            """SELECT id,instant,camera_id,COALESCE(plate_manual,plate) plate
+                            FROM current_visits WHERE kind='exit' AND instant>=?
+                            ORDER BY instant,id LIMIT 26 OFFSET ?""",
+            (entry["instant"], (page - 1) * 25),
+        ).fetchall()
+    return dict(exits=[dict(r) for r in rows[:25]], more=len(rows) > 25)

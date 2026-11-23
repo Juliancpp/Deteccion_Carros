@@ -337,8 +337,11 @@ def _write_status_json(status_file: str, coordinator, analyzers, consumer, clip_
             last_plate = getattr(last_run, "plate", None)
             last_room = last_run.room_number
 
+        geometry = getattr(getattr(analyzer, "camera", None), "geometry", None)
         camera_data[cam.camera_id] = {
             "connected": bool(cam.stream_connected),
+            "geometry_configured": bool(geometry) if analyzer else None,
+            "geometry_features": [f.id for f in geometry.features if f.enabled] if geometry else [],
             "capture_fps": float(round(cam.capture_fps, 2)),
             "inference_fps": float(round(cam.actual_inference_fps, 2)),
             "frame_age_seconds": float(round(now - cam.last_inference_at, 3)) if cam.last_inference_at > 0 else None,

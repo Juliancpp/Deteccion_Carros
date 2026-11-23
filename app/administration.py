@@ -48,6 +48,7 @@ def migrate():
             is_active INTEGER NOT NULL DEFAULT 1 CHECK(is_active IN (0,1)),
             created_at TEXT NOT NULL, updated_at TEXT NOT NULL, last_login TEXT
         );
+        CREATE TABLE IF NOT EXISTS display_settings (id INTEGER PRIMARY KEY, page_size INTEGER NOT NULL CHECK(page_size BETWEEN 1 AND 100), actor INTEGER NOT NULL REFERENCES users(id), changed_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);
         CREATE TABLE IF NOT EXISTS auth_sessions (
             token_hash TEXT PRIMARY KEY, user_id INTEGER NOT NULL REFERENCES users(id),
             csrf_token TEXT NOT NULL, expires_at REAL NOT NULL, created_at TEXT NOT NULL
