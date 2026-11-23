@@ -17,7 +17,7 @@ async function apiCall(url, options={}) { const headers=new Headers(options.head
 async function loadMe(){ try{const m=await apiCall('/api/auth/me'); if(!m.authenticated||!m.user||!m.csrf_token)throw Error('Sesión inválida'); csrfToken=m.csrf_token;sessionValid=true;el.userGreeting.textContent=`Hola, ${m.user.username}`;}catch(e){console.error('loadMe failed:',e);throw e;} }
 function eventState(ev){if(ev.visit_id)return ['Completada','complete'];if(ev.review_required)return ['Requiere revisión','review'];if(ev.event_type==='SALIDA_SIN_ENTRADA')return ['Sin entrada','unpaired'];if(ev.event_type?.startsWith('ENTRADA'))return ['Sin salida','unpaired'];return ['No resuelto','error'];}
 function movementLabel(v){return ({INWARD:'Entrada',OUTWARD:'Salida',UNKNOWN:'Evento'})[v]||v||'—';}
-function plateMarkup(ev){const p=ev.plate||'SIN PLACA';return `<strong class="plate-value">${escapeHtml(p)}</strong>${ev.plate_manual?'<small class="muted">✓ corregida manualmente</small>':!ev.plate?'<small class="muted">OCR no legible</small>':''}`;}
+function plateMarkup(ev){const p=ev.plate||'SIN PLACA';return `<strong class="plate-value">${escapeHtml(p)}</strong>${ev.plate_manual?'<small class="muted">✓ corregida manualmente</small>':`<small class="muted">${escapeHtml(ev.plate_status || 'Sin estado OCR')}</small>`}`;}
 function renderEvents(events){el.eventsTable.replaceChildren();if(!events.length){el.eventsTable.innerHTML='<tr><td colspan="8" class="empty">No hay registros para este periodo.</td></tr>';return;}events.forEach(ev=>{const [state,cls]=eventState(ev),row=document.createElement('tr');row.innerHTML=`<td><strong>${formatDateTime(ev.occurred_at)}</strong><small>${escapeHtml(ev.event_id)}</small></td><td>${escapeHtml(ev.camera_id)}</td><td><span class="badge movement-${(ev.movement||'').toLowerCase()}">${movementLabel(ev.movement)}</span></td><td>${plateMarkup(ev)}</td><td>${ev.room_number?`#${ev.room_number}`:'—'}</td><td><span class="badge ${cls}">${state}</span></td><td>${ev.evidence_url?`<button class="icon-button" title="Ver foto" data-photo="${escapeHtml(ev.evidence_url)}">▧</button>`:''}${ev.clip_url?`<button class="icon-button" title="Ver video" data-video="${escapeHtml(ev.clip_url)}" data-id="${escapeHtml(ev.event_id)}">▶</button>`:''}</td><td class="row-actions"><button class="btn-small" data-detail="${escapeHtml(ev.event_id)}">Ver</button>${ev.event_type?.startsWith('ENTRADA')?`<button class="btn-small primary" data-associate="${escapeHtml(ev.event_id)}">Asociar salida</button>`:''}<button class="btn-small" data-correct="${escapeHtml(ev.event_id)}">Editar placa</button>${ev.visit_id?`<button class="btn-small" data-unlink="${ev.visit_id}">Desasociar</button>`:''}</td>`;el.eventsTable.appendChild(row);});}
 function renderVisits(visits){el.eventsTable.replaceChildren();if(!visits.length){el.eventsTable.innerHTML='<tr><td colspan="8" class="empty">No hay visitas completadas para este periodo.</td></tr>';return;}visits.forEach(v=>{const row=document.createElement('tr'),entry=v.entry||{},exit=v.exit||{};row.innerHTML=`<td><strong>${formatDateTime(entry.occurred_at)}</strong><small>${escapeHtml(entry.event_id||'')}</small></td><td><strong>${formatDateTime(exit.occurred_at)}</strong><small>${escapeHtml(exit.event_id||'')}</small></td><td>${formatDuration(entry.occurred_at,exit.occurred_at)}</td><td>${plateMarkup(entry)}</td><td>${entry.room_number?`#${entry.room_number}`:'—'}</td><td><span class="badge complete">Completada</span></td><td>—</td><td class="row-actions"><button class="btn-small" data-unlink="${v.id}">Desasociar</button></td>`;el.eventsTable.appendChild(row);});}
 async function loadEvents(){const q=new URLSearchParams({page:currentPage,page_size:pageSize,month:monthValue()});[['plate','filterPlate'],['camera','filterCamera'],['date_from','filterDateFrom'],['date_to','filterDateTo'],['movement','filterType'],['room','filterRoom'],['review_required','filterReview']].forEach(([k,id])=>{if(el[id]?.value)q.set(k,el[id].value)});if(activeTab==='visits'){try{const d=await apiCall(`/api/hotel/visits?${q}`);renderVisits(d.visits);el.eventsMeta.textContent=`Mostrando ${d.total?((currentPage-1)*pageSize+1):0}-${Math.min(currentPage*pageSize,d.total)} de ${d.total} visitas`;el.pageIndicator.textContent=`${d.page} / ${d.pages||1}`;el.btnPrevPage.disabled=currentPage<=1;el.btnNextPage.disabled=currentPage>=d.pages;return;}catch(e){console.error('loadVisits failed:',e);}}if(activeTab==='entries')q.set('movement','INWARD');if(activeTab==='exits')q.set('movement','OUTWARD');if(activeTab==='pending')q.set('status','UNPAIRED');try{const d=await apiCall(`/api/hotel/events?${q}`);renderEvents(d.events);el.eventsMeta.textContent=`Mostrando ${d.total?((currentPage-1)*pageSize+1):0}-${Math.min(currentPage*pageSize,d.total)} de ${d.total} registros`;el.pageIndicator.textContent=`${d.page} / ${d.pages||1}`;el.btnPrevPage.disabled=currentPage<=1;el.btnNextPage.disabled=currentPage>=d.pages;}catch(e){console.error('loadEvents failed:',e);el.eventsMeta.textContent='Error al cargar. Intenta de nuevo.';}}
@@ -27,10 +27,81 @@ async function refreshSnapshot(cam){const img=$(`cam${cam}_img`),overlay=$(`cam$
 function eventCard(ev,radio){const d=document.createElement(radio?'label':'div');d.className='association-event';if(radio)d.innerHTML=`<input type="radio" name="exit_event_id" value="${escapeHtml(ev.event_id)}">`;d.insertAdjacentHTML('beforeend',`<span><strong>${escapeHtml(ev.plate||'SIN PLACA')}</strong><small>${formatDateTime(ev.occurred_at)} · ${escapeHtml(ev.camera_id)} · ${formatDuration(selectedEntryId?window.__entryAt:ev.occurred_at,ev.occurred_at)}</small></span>${ev.evidence_url?`<img src="${escapeHtml(ev.evidence_url)}" alt="Evidencia">`:''}`);return d;}
 async function openAssociation(id){selectedEntryId=id;el.associationEmpty.classList.add('hidden');el.associationContent.classList.remove('hidden');el.confirmAssociation.disabled=false;try{const [entry,out]=await Promise.all([apiCall(`/api/hotel/events/${encodeURIComponent(id)}`),apiCall(`/api/hotel/events/exits/unpaired?entry_event_id=${encodeURIComponent(id)}`)]);window.__entryAt=entry.occurred_at;el.selectedEntry.replaceChildren(eventCard(entry,false));el.availableExits.replaceChildren(...out.events.slice(0,5).map(e=>eventCard(e,true)));el.associationMessage.textContent=out.events.length?'Selecciona una salida':'No hay salidas posteriores disponibles';}catch(e){console.error('openAssociation failed:',e);el.associationMessage.textContent=e.message;}}
 async function associate(){const pick=document.querySelector('input[name=exit_event_id]:checked');if(!pick||!selectedEntryId)return;el.confirmAssociation.disabled=true;try{await apiCall('/api/hotel/visits/associate',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({entry_event_id:selectedEntryId,exit_event_id:pick.value})});el.operationMessage.textContent='✓ Visita completada';el.associationEmpty.classList.remove('hidden');el.associationContent.classList.add('hidden');selectedEntryId=null;await Promise.all([loadEvents(),loadStats()]);}catch(e){console.error('association failed:',e);el.associationMessage.textContent=e.message;}finally{el.confirmAssociation.disabled=false;}}
+function evidencePreview(frame, readings) {
+    const panel = document.createElement('div');
+    const select = document.createElement('select');
+    select.setAttribute('aria-label', 'Hipótesis OCR para inspeccionar');
+    for (const reading of readings) {
+        select.add(new Option(`${reading.raw_text} · ${reading.variant_type}`));
+    }
+    const canvas = document.createElement('canvas');
+    canvas.style.maxWidth = '100%';
+    const photo = new Image();
+    const draw = () => {
+        if (!photo.naturalWidth) return;
+        const ctx = canvas.getContext('2d');
+        ctx.drawImage(photo, 0, 0);
+        const points = readings[select.selectedIndex]?.text_polygon;
+        if (!points?.length) return;
+        ctx.beginPath();
+        ctx.moveTo(...points[0]);
+        for (const point of points.slice(1)) ctx.lineTo(...point);
+        ctx.closePath();
+        ctx.strokeStyle = '#ffbf00';
+        ctx.lineWidth = 2;
+        ctx.stroke();
+    };
+    photo.onload = () => {
+        canvas.width = photo.naturalWidth;
+        canvas.height = photo.naturalHeight;
+        draw();
+    };
+    photo.onerror = () => { panel.textContent = 'Fotograma no disponible.'; };
+    select.addEventListener('change', draw);
+    panel.append(select, canvas);
+    photo.src = frame.evidence_url;
+    return panel;
+}
+async function openDetail(id) {
+    el.correctionModal.classList.remove('hidden');
+    el.modalAuditLogs.textContent = 'Cargando evidencia…';
+    try {
+        const ev = await apiCall('/api/hotel/events/' + encodeURIComponent(id));
+        const diagnostic = ev.ocr_diagnostics || {};
+        const readings = JSON.parse(ev.plate_candidates || '[]');
+        el.modalAuditLogs.replaceChildren();
+        const line = text => {
+            const p = document.createElement('p');
+            p.textContent = text;
+            el.modalAuditLogs.appendChild(p);
+        };
+        line([ev.camera_id, formatDateTime(ev.occurred_at), ev.verification_status, diagnostic.engine_status].filter(Boolean).join(' · '));
+        for (const frame of diagnostic.frames || []) {
+            line(formatDateTime(frame.captured_at));
+            const hypotheses = readings.filter(r => r.frame_id === frame.frame_id);
+            if (frame.evidence_url) {
+                const link = document.createElement('a');
+                link.href = frame.evidence_url;
+                link.textContent = 'Abrir fotograma OCR';
+                link.target = '_blank';
+                link.rel = 'noopener';
+                el.modalAuditLogs.appendChild(link);
+                el.modalAuditLogs.appendChild(evidencePreview(frame, hypotheses));
+            }
+            for (const r of hypotheses) {
+                line(`${r.raw_text} · motor ${Math.round(r.ocr_confidence * 100)}% · ${r.crop_type} / ${r.variant_type}`);
+            }
+        }
+        line(`Decisión OCR: ${ev.plate_original || '—'} · ${Math.round(ev.plate_confidence * 100)}%`);
+        if (ev.plate_manual) line('Corrección manual: ' + ev.plate_manual);
+    } catch (error) {
+        el.modalAuditLogs.textContent = error.message;
+    }
+}
 async function openCorrection(id){try{const ev=await apiCall(`/api/hotel/events/${id}`);el.correctionEmpty.classList.add('hidden');el.correctionForm.classList.remove('hidden');el.modalEventId.value=id;el.modalPlateOriginal.textContent=ev.plate_original||'SIN PLACA';el.modalPlate.value=ev.plate_manual||ev.plate||'';el.correctionMessage.textContent='';}catch(e){console.error('openCorrection failed:',e);}}
 async function saveCorrection(e){e.preventDefault();try{await apiCall(`/api/hotel/events/${el.modalEventId.value}`,{method:'PATCH',headers:{'Content-Type':'application/json'},body:JSON.stringify({plate:el.modalPlate.value})});el.correctionMessage.textContent='✓ Corrección guardada';await loadEvents();}catch(e){console.error('plate correction failed:',e);el.correctionMessage.textContent=e.message;}}
 async function unlink(id){if(!confirm('¿Desasociar esta visita?'))return;try{await apiCall(`/api/hotel/visits/${id}/association`,{method:'DELETE'});await Promise.all([loadEvents(),loadStats()]);}catch(e){console.error('unlink failed:',e);}}
-function bindUI(){el.filterForm.addEventListener('submit',e=>{e.preventDefault();currentPage=1;loadEvents();});el.clearFilters.addEventListener('click',()=>{el.filterForm.reset();currentPage=1;loadEvents();});el.monthPicker.value=new Date().toISOString().slice(0,7);el.monthPicker.addEventListener('change',()=>{currentPage=1;loadStats();loadEvents();});el.btnPrevPage.addEventListener('click',()=>{currentPage--;loadEvents()});el.btnNextPage.addEventListener('click',()=>{currentPage++;loadEvents()});el.confirmAssociation.addEventListener('click',associate);el.correctionForm.addEventListener('submit',saveCorrection);el.btnCancelCorrection.addEventListener('click',()=>{el.correctionForm.classList.add('hidden');el.correctionEmpty.classList.remove('hidden')});el.btnCloseModal.addEventListener('click',()=>el.correctionModal.classList.add('hidden'));el.btnCloseVideoModal.addEventListener('click',()=>el.videoModal.classList.add('hidden'));el.eventsTable.addEventListener('click',e=>{const b=e.target.closest('button');if(!b)return;if(b.dataset.associate)openAssociation(b.dataset.associate);if(b.dataset.correct)openCorrection(b.dataset.correct);if(b.dataset.unlink)unlink(b.dataset.unlink);if(b.dataset.video){el.evidenceVideo.src=b.dataset.video;el.videoModalTitle.textContent=b.dataset.id;el.videoModal.classList.remove('hidden');}if(b.dataset.detail)openCorrection(b.dataset.detail);});document.querySelectorAll('.tab').forEach(t=>t.addEventListener('click',()=>{document.querySelectorAll('.tab').forEach(x=>x.classList.remove('active'));t.classList.add('active');activeTab=t.dataset.tab;currentPage=1;loadEvents()}));el.logoutBtn.addEventListener('click',async()=>{try{await apiCall('/api/auth/logout',{method:'POST'})}finally{redirectLogin()}});el.btnExport.addEventListener('click',()=>location.href='/downloads/control_vehiculos.xlsx');}
+function bindUI(){el.filterForm.addEventListener('submit',e=>{e.preventDefault();currentPage=1;loadEvents();});el.clearFilters.addEventListener('click',()=>{el.filterForm.reset();currentPage=1;loadEvents();});el.monthPicker.value=new Date().toISOString().slice(0,7);el.monthPicker.addEventListener('change',()=>{currentPage=1;loadStats();loadEvents();});el.btnPrevPage.addEventListener('click',()=>{currentPage--;loadEvents()});el.btnNextPage.addEventListener('click',()=>{currentPage++;loadEvents()});el.confirmAssociation.addEventListener('click',associate);el.correctionForm.addEventListener('submit',saveCorrection);el.btnCancelCorrection.addEventListener('click',()=>{el.correctionModal.classList.add('hidden');el.correctionForm.classList.add('hidden');el.correctionEmpty.classList.remove('hidden')});el.btnCloseModal.addEventListener('click',()=>el.correctionModal.classList.add('hidden'));el.btnCloseVideoModal.addEventListener('click',()=>el.videoModal.classList.add('hidden'));el.eventsTable.addEventListener('click',e=>{const b=e.target.closest('button');if(!b)return;if(b.dataset.associate)openAssociation(b.dataset.associate);if(b.dataset.correct)openCorrection(b.dataset.correct);if(b.dataset.unlink)unlink(b.dataset.unlink);if(b.dataset.video){el.evidenceVideo.src=b.dataset.video;el.videoModalTitle.textContent=b.dataset.id;el.videoModal.classList.remove('hidden');}if(b.dataset.photo)window.open(b.dataset.photo, '_blank', 'noopener');if(b.dataset.detail)openDetail(b.dataset.detail);});document.querySelectorAll('.tab').forEach(t=>t.addEventListener('click',()=>{document.querySelectorAll('.tab').forEach(x=>x.classList.remove('active'));t.classList.add('active');activeTab=t.dataset.tab;currentPage=1;loadEvents()}));el.logoutBtn.addEventListener('click',async()=>{try{await apiCall('/api/auth/logout',{method:'POST'})}finally{redirectLogin()}});el.btnExport.addEventListener('click',()=>location.href='/downloads/control_vehiculos.xlsx');}
 function startPolling(){if(pollingStarted)return;pollingStarted=true;timers.push(...[setInterval(loadStatus,1500),setInterval(loadStats,5000),setInterval(loadEvents,5000),setInterval(()=>{refreshSnapshot('A1');refreshSnapshot('A5')},2000)]);}
 let dashboardInitialization;
 function initializeDashboard(){

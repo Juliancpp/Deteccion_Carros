@@ -186,11 +186,8 @@ class ClipManager:
                     continue
 
                 date_str = anchor_at.strftime("%Y-%m-%d")
-                time_str = anchor_at.strftime("%Y-%m-%d_%H-%M-%S")
                 evt = job["event_type"]
-                pl = job["plate"] or "NO_LEGIBLE"
-                uid = uuid.uuid4().hex[:6]
-                filename = f"{camera_id}_{evt}_{pl}_{time_str}_{uid}.mp4"
+                filename = uuid.uuid4().hex + ".mp4"
                 relative_clip_path = os.path.join(self.clips_dir, camera_id, date_str, filename)
                 abs_clip_path = os.path.abspath(relative_clip_path)
                 metadata = {

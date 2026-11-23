@@ -375,6 +375,10 @@ def get_hotel_event_detail(event_id: str, authenticated: dict = Depends(check_au
                WHERE a.entity_type='event' AND a.entity_id=? ORDER BY a.id DESC""", (event_id,))]
         ev["legacy_audit_logs"] = [dict(r) for r in c.execute(
             "SELECT * FROM hotel_event_audit WHERE event_id=? ORDER BY changed_at DESC", (event_id,))]
+    diagnostics = json.loads(ev.get("ocr_diagnostics_json") or "{}")
+    for frame in diagnostics.get("frames", []):
+        frame["evidence_url"] = _relative_evidence_url(frame.pop("evidence_path", None))
+    ev["ocr_diagnostics"] = diagnostics
     return enrich_event(ev)
 
 

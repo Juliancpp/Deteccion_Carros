@@ -70,3 +70,4 @@ class HotelVehicleEvent:
     room_vote_margin: float = 0.0
     review_reasons_json: str | None = None
     source: str = "mvp_hotel"
+    ocr_diagnostics_json: str | None = None

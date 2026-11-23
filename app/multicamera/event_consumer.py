@@ -6,7 +6,8 @@ import threading
 import time
 import traceback
 import uuid
-from dataclasses import dataclass
+from collections import Counter
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Optional
 
@@ -49,6 +50,7 @@ class ConsumerStatus:
     consecutive_failures: int = 0
     total_failures: int = 0
     oldest_queue_item_age: Optional[float] = None
+    ocr_counts: dict = field(default_factory=dict)
 
 
 class MultiCameraEvidenceCapture(EvidenceCapture):
@@ -83,16 +85,14 @@ class HotelEvidenceCapture(EvidenceCapture):
         camera_id = str(event.get("camera_id", "default"))
         timestamp = self._event_datetime(event)
         date_dir = timestamp.strftime("%Y-%m-%d")
-        filename_timestamp = timestamp.strftime("%Y-%m-%d_%H-%M-%S")
-        event_type = str(event.get("type", "event")).upper()
-        plate = str(event.get("plate") or "NO_LEGIBLE").upper()
+        return os.path.join(self.capture_dir, camera_id, date_dir, uuid.uuid4().hex + ".jpg")
 
-        # Generar nombre resistente a colisiones sin perder semántica
-        unique_id = uuid.uuid4().hex[:6]
-        filename = f"{camera_id}_{event_type}_{plate}_{filename_timestamp}_{unique_id}.jpg"
-
-        # Ruta: data/captures/<camera_id>/YYYY-MM-DD/filename
-        return os.path.join(self.capture_dir, camera_id, date_dir, filename)
+    def save_ocr_frame(self, image, camera_id, captured_at):
+        path = self._build_filepath({"camera_id": camera_id, "timestamp": captured_at.isoformat()})
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        if not cv2.imwrite(path, image):
+            raise OSError("ocr_evidence_write_failed")
+        return path
 
     def _draw_evidence(
         self,
@@ -179,6 +179,7 @@ class MultiCameraEventConsumer:
         self._processed_events = 0
         self._failed_events = 0
         self._invalid_events = 0
+        self._ocr_counts = Counter()
         self._ocr_failures = 0
         self._evidence_failures = 0
         self._database_failures = 0
@@ -236,6 +237,7 @@ class MultiCameraEventConsumer:
                 failed_events=self._failed_events,
                 invalid_events=self._invalid_events,
                 ocr_failures=self._ocr_failures,
+                ocr_counts=dict(self._ocr_counts),
                 evidence_failures=self._evidence_failures,
                 database_failures=self._database_failures,
                 last_event_at=self._last_event_at,
@@ -435,6 +437,7 @@ class MultiCameraEventConsumer:
                 logical_id = analyzer.linker.get_logical_id(candidate.camera_id, candidate.track_id)
                 linked_track_ids = analyzer.linker.get_linked_track_ids(candidate.camera_id, logical_id)
 
+            select_start = time.perf_counter()
             # 4. OCR Multiframe
             ocr_candidates = []
             if self.frame_buffer and candidate.track_id is not None:
@@ -447,6 +450,7 @@ class MultiCameraEventConsumer:
                         "frame": cf.frame,
                         "bbox": cf.bbox,
                         "frame_score": cf.score,
+                        "source_sequence": cf.source_sequence,
                         "captured_at": cf.captured_at
                     })
 
@@ -456,59 +460,13 @@ class MultiCameraEventConsumer:
                     "frame": frame,
                     "bbox": (cx1, cy1, cx2, cy2),
                     "frame_score": 1.0,
+                    "source_sequence": candidate.source_sequence,
                     "captured_at": candidate.captured_at
                 })
 
-            # Ejecutar OCR sobre cada candidato
-            voted_candidates = []
-            for idx, oc in enumerate(ocr_candidates):
-                f_candidate = oc["frame"]
-                b_candidate = oc["bbox"]
-                f_score = oc["frame_score"]
-                frame_id = oc.get("captured_at")
-                if frame_id is None:
-                    frame_id = f"fallback_{idx}"
-                else:
-                    frame_id = str(frame_id)
-
-                crop = safe_crop(f_candidate, b_candidate, padding=self._padding)
-                vehicle_image = crop.crop
-
-                if vehicle_image is not None and vehicle_image.size > 0:
-                    try:
-                        if hasattr(self.plate_reader, "read_all_candidates"):
-                            plate_results = self.plate_reader.read_all_candidates(vehicle_image, frame_id=frame_id)
-                            for pr in plate_results:
-                                voted_candidates.append({
-                                    "plate": pr["plate"],
-                                    "confidence": pr["confidence"],
-                                    "frame_score": f_score,
-                                    "frame_id": frame_id
-                                })
-                        else:
-                            plate_result = self.plate_reader.read(vehicle_image)
-                            if plate_result and plate_result.get("plate"):
-                                voted_candidates.append({
-                                    "plate": plate_result["plate"],
-                                    "confidence": float(plate_result["confidence"]),
-                                    "frame_score": f_score,
-                                    "frame_id": frame_id
-                                })
-                    except Exception as e:
-                        with self._lock:
-                            self._ocr_failures += 1
-                            self._last_error = f"Error en lectura OCR individual: {e}"
-                        logger.warning("Fallo en lectura OCR individual: %s", e)
-
-            # Votación ponderada multiframe
-            try:
-                voted_res = vote_plates_multiframe(voted_candidates)
-            except Exception as e:
-                with self._lock:
-                    self._ocr_failures += 1
-                    self._last_error = f"Error en votación multiframe: {e}"
-                logger.warning("Fallo en votación multiframe: %s", e, exc_info=True)
-                voted_res = {"plate": None, "confidence": 0.0, "status": "NO_LEGIBLE", "candidates": []}
+            select_ms = (time.perf_counter() - select_start) * 1000
+            voted_res, diagnostics = self._inspect_frames(candidate, logical_id, ocr_candidates)
+            diagnostics["metrics"]["select_ms"] = select_ms
             plate_text = voted_res["plate"]
             plate_confidence = voted_res["confidence"]
             plate_status = voted_res["status"]
@@ -520,10 +478,12 @@ class MultiCameraEventConsumer:
             notes = ""
             if self.hotel_store:
                 event_type, review_required, notes = classify_event(
-                    candidate.camera_id, movement, plate_text, self.hotel_store
+                    candidate.camera_id, movement, plate_text if plate_status == "LEIDA" else None, self.hotel_store
                 )
 
             # Reglas adicionales de revisión
+            if plate_status != "LEIDA" or diagnostics["engine_status"] != "OK":
+                review_required = True
             if plate_status == "NO_LEGIBLE":
                 review_required = True
                 if "placa no legible" not in notes:
@@ -543,8 +503,8 @@ class MultiCameraEventConsumer:
                     notes = f"habitacion no determinada; {notes}" if notes else "habitacion no determinada"
 
             # 6. Guardar evidencia física
-            evidence_path = None
-            if self.evidence:
+            evidence_path = diagnostics["selected_evidence"]
+            if self.evidence and not evidence_path:
                 try:
                     vehicle_dict = {
                         "bbox": (cx1, cy1, cx2, cy2),
@@ -570,11 +530,15 @@ class MultiCameraEventConsumer:
                         self._last_error = f"Error al guardar evidencia: {e}"
                     logger.warning("Fallo no crítico guardando evidencia: %s", e, exc_info=True)
 
+            if any(r.get("evidence_error") for r in diagnostics["frames"]):
+                review_required = True
+                notes = self._append_note(notes, "evidencia OCR incompleta")
             if not evidence_path:
                 review_required = True
                 if "evidencia faltante" not in notes:
                     notes = f"evidencia faltante; {notes}" if notes else "evidencia faltante"
 
+            db_start = time.perf_counter()
             # 7. Persistencia base de datos tradicional (eventos.db)
             if self.db_manager:
                 try:
@@ -591,11 +555,11 @@ class MultiCameraEventConsumer:
                 except Exception as e:
                     with self._lock:
                         self._database_failures += 1
-                        self._last_error = f"Fallo al persistir en eventos.db: {e}"
+                        self._last_error = f"Fallo al persistir en eventos.db: {type(e).__name__}"
                     review_required = True
                     notes = self._append_note(notes, "sqlite eventos.db falló")
                     persistence_failed = True
-                    logger.error("Error al guardar en eventos.db: %s", e, exc_info=True)
+                    logger.error("db_write_failed db=eventos error=%s", type(e).__name__)
 
             # 8. Persistencia base de datos Hotel MVP (hotel_mvp.db)
             if self.hotel_store:
@@ -622,6 +586,12 @@ class MultiCameraEventConsumer:
                         notes=notes,
                         source="geometry_gate" if candidate.geometry_gate else "mvp_hotel",
                         plate_supporting_frames_json=json.dumps(voted_res.get("supporting_frame_ids", ())),
+                        logical_vehicle_id=logical_id,
+                        original_track_ids_json=json.dumps(sorted(linked_track_ids)),
+                        review_reasons_json=json.dumps(voted_res["review_reasons"]),
+                        ocr_diagnostics_json=json.dumps(diagnostics),
+                        plate_runner_up=voted_res.get("runner_up_plate"),
+                        plate_runner_up_confidence=voted_res.get("runner_up_confidence", 0.0),
                         plate_vote_margin=float(voted_res.get("vote_margin", 0.0)),
                         plate_candidates=plate_candidates_list
                     )
@@ -645,10 +615,12 @@ class MultiCameraEventConsumer:
                 except Exception as e:
                     with self._lock:
                         self._database_failures += 1
-                        self._last_error = f"Fallo al persistir en hotel_mvp.db: {e}"
+                        self._last_error = f"Fallo al persistir en hotel_mvp.db: {type(e).__name__}"
                     persistence_failed = True
-                    logger.error("Error al guardar en hotel_mvp.db: %s", e, exc_info=True)
+                    logger.error("db_write_failed db=hotel error=%s", type(e).__name__)
 
+            logger.info("event_persistence camera=%s elapsed_ms=%.2f failed=%s",
+                        candidate.camera_id, (time.perf_counter() - db_start) * 1000, persistence_failed)
             success = not persistence_failed
 
         except Exception as e:
@@ -674,6 +646,78 @@ class MultiCameraEventConsumer:
                 self._average_processing_ms = (
                     self._total_processing_ms / self._processed_events
                 )
+
+    def _inspect_frames(self, event, logical_id, frames):
+        candidates = []
+        reports = []
+        seen = set()
+        for item in frames:
+            timestamp = item["captured_at"]
+            sequence = item.get("source_sequence")
+            frame_id = f"{event.camera_id}:{event.session_id}:{sequence if sequence is not None else timestamp}"
+            if frame_id in seen:
+                continue
+            seen.add(frame_id)
+            crop = safe_crop(item["frame"], item["bbox"], padding=self._padding)
+            report = dict(frame_id=frame_id, captured_at=str(timestamp), source_sequence=sequence,
+                          vehicle_crop_bbox=crop.bbox, evidence_path=None, engine_status="SIN_CANDIDATO")
+            reports.append(report)
+            if crop.crop is None:
+                continue
+            try:
+                if hasattr(self.plate_reader, "inspect_frame"):
+                    readings, metrics = self.plate_reader.inspect_frame(crop.crop, frame_id)
+                    report.update(metrics)
+                elif hasattr(self.plate_reader, "read_all_candidates"):
+                    readings = self.plate_reader.read_all_candidates(crop.crop, frame_id=frame_id)
+                    report["engine_status"] = "OK"
+                else:
+                    result = self.plate_reader.read(crop.crop)
+                    readings = [result] if result else []
+                    report["engine_status"] = "OK"
+            except Exception:
+                readings = []
+                report.update(engine_status="ERROR_OCR", errors=1)
+            if report["engine_status"] == "MOTOR_NO_DISPONIBLE":
+                report["errors"] = 1
+            if report.get("errors"):
+                with self._lock:
+                    self._ocr_failures += report["errors"]
+                    self._last_error = "ERROR_OCR"
+            for reading in readings:
+                candidates.append(dict(reading, camera_id=event.camera_id, track_id=event.track_id,
+                                       logical_vehicle_id=logical_id, source_sequence=sequence,
+                                       frame_id=frame_id, captured_at=str(timestamp), frame_score=item["frame_score"]))
+            if readings and hasattr(self.evidence, "save_ocr_frame"):
+                started = time.perf_counter()
+                try:
+                    report["evidence_path"] = self.evidence.save_ocr_frame(crop.crop, event.camera_id, timestamp)
+                except (OSError, cv2.error):
+                    with self._lock:
+                        self._evidence_failures += 1
+                    report["evidence_error"] = True
+                report["evidence_ms"] = (time.perf_counter() - started) * 1000
+
+        start = time.perf_counter()
+        decision = vote_plates_multiframe(candidates, observed_only=True)
+        states = {r["engine_status"] for r in reports}
+        engine = next((state for state in ("ERROR_OCR", "MOTOR_NO_DISPONIBLE", "OK") if state in states),
+                      "SIN_CANDIDATO")
+        supporting = set(decision["supporting_frame_ids"])
+        selected = next((r for r in reports if r["frame_id"] in supporting and r["evidence_path"]), None)
+        totals = {key: sum(r.get(key, 0) for r in reports)
+                  for key in ("engine_calls", "crops", "errors", "locate_ms", "preprocess_ms", "engine_ms", "evidence_ms")}
+        totals["vote_ms"] = (time.perf_counter() - start) * 1000
+        with self._lock:
+            self._ocr_counts.update(events=1, frames=len(reports), crops=totals["crops"],
+                                    engine_calls=totals["engine_calls"], technical_errors=totals["errors"])
+            self._ocr_counts[decision["status"]] += 1
+        logger.info("ocr_event %s", json.dumps(dict(totals, frames=len(reports), status=decision["status"],
+                                                    camera=event.camera_id, engine_status=engine)))
+        return decision, dict(engine_status=engine, frames=reports, metrics=totals,
+                              partial_text=decision.get("partial_text"),
+                              selected_frame_id=selected["frame_id"] if selected else None,
+                              selected_evidence=selected["evidence_path"] if selected else None)
 
     def _save_hotel_event_with_retry(self, hotel_event: HotelVehicleEvent) -> None:
         if self.hotel_store is None:

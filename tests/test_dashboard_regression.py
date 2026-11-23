@@ -248,3 +248,29 @@ def test_vehicle_routes_and_populated_geometry_require_active_session(client):
     assert client.post('/api/auth/logout').status_code == 200
     client.cookies.set(api.SESSION_COOKIE, token)
     assert client.get(endpoint).status_code == 401
+
+
+def test_ocr_detail_exposes_observation_and_protected_frame(browser_page, tmp_path, monkeypatch):
+    from app import administration
+    from playwright.sync_api import expect
+
+    page, base = browser_page
+    monkeypatch.setattr(config, "CAPTURE_DIR", str(tmp_path))
+    jpeg = tmp_path / "A1" / "2026-09-01" / "opaque.jpg"
+    jpeg.parent.mkdir(parents=True)
+    assert cv2.imwrite(str(jpeg), np.zeros((30, 70, 3), np.uint8))
+    diagnostics = {"engine_status": "OK", "frames": [
+        {"frame_id": "frame1", "captured_at": "2026-09-01T12:00:00", "evidence_path": str(jpeg)}]}
+    hypotheses = [{"raw_text": "QBC?3", "ocr_confidence": .45, "frame_id": "frame1",
+                   "crop_type": "lower_center", "variant_type": "clahe"}]
+    with administration.connection() as conn, conn:
+        conn.execute("UPDATE hotel_vehicle_events SET plate=NULL, plate_status='PARCIAL', "
+                     "ocr_diagnostics_json=?, plate_candidates=? WHERE event_id='entry'",
+                     (json.dumps(diagnostics), json.dumps(hypotheses)))
+    browser_login(page, base)
+    page.locator('button[data-detail="entry"]').click()
+    expect(page.locator('#modalAuditLogs')).to_contain_text('QBC?3')
+    link = page.get_by_role('link', name='Abrir fotograma OCR')
+    assert page.request.get(base + link.get_attribute("href")).status == 200
+    page.locator('#btnCloseModal').click()
+    expect(page.locator('#correctionModal')).to_be_hidden()

@@ -121,6 +121,7 @@ class HotelStore:
             columns = [row["name"] for row in cursor.fetchall()]
             
             cols_to_add = {
+                "ocr_diagnostics_json": "TEXT",
                 "movement_confidence": "REAL NOT NULL DEFAULT 0.0",
                 "clip_path": "TEXT",
                 "clip_status": "TEXT NOT NULL DEFAULT 'DISABLED'",
@@ -189,8 +190,8 @@ class HotelStore:
                     corrected_at, correction_notes, logical_vehicle_id, original_track_ids_json,
                     plate_raw_candidates_json, plate_runner_up, plate_runner_up_confidence,
                     plate_vote_margin, plate_supporting_frames_json, room_score_breakdown_json,
-                    room_runner_up, room_vote_margin, review_reasons_json, source, source_event_id
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    room_runner_up, room_vote_margin, review_reasons_json, source, source_event_id, ocr_diagnostics_json
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 {conflict}
                 """,
                 (
@@ -234,6 +235,7 @@ class HotelStore:
                     review_reasons_json,
                     event.source,
                     event.event_id,
+                    event.ocr_diagnostics_json,
                 ),
             )
             if cursor.rowcount:
@@ -333,7 +335,7 @@ class HotelStore:
         cursor.execute("SELECT COUNT(*) FROM hotel_vehicle_events WHERE review_required = 1")
         pending_review = cursor.fetchone()[0]
         
-        cursor.execute("SELECT COUNT(*) FROM hotel_vehicle_events WHERE plate_status != 'NO_LEGIBLE'")
+        cursor.execute("SELECT COUNT(*) FROM hotel_vehicle_events WHERE plate_status IN ('PROBABLE', 'LEIDA')")
         ocr_completed = cursor.fetchone()[0]
         
         return {
@@ -552,6 +554,7 @@ class HotelStore:
                 evidence_path=row["evidence_path"],
                 review_required=bool(row["review_required"]),
                 source=row["source"],
+                ocr_diagnostics_json=row["ocr_diagnostics_json"],
                 notes=row["notes"]
             )
             if not _eligible_for_visit(event):
@@ -603,6 +606,8 @@ class HotelStore:
 
 
 def _eligible_for_visit(event: HotelVehicleEvent) -> bool:
+    if event.ocr_diagnostics_json and event.plate_status != "LEIDA":
+        return False
     if event.source == "geometry_gate" and (
         event.review_required or event.plate_status != "LEIDA" or not event.evidence_path
     ):

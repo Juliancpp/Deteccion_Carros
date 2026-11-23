@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
+import logging
 import argparse
 import os
 import resource
@@ -51,6 +52,7 @@ def parse_args():
 
 def main() -> int:
     args = parse_args()
+    logging.basicConfig(level=logging.INFO)
     shutdown_event = _install_signal_handlers()
     started = time.monotonic()
     started_wall = datetime.now()
@@ -171,7 +173,7 @@ def main() -> int:
                                     track_id=vehicle["id"],
                                     session_id=result.session_id,
                                     frame=frame_to_buffer,
-                                    vehicle=vehicle,
+                                    vehicle=dict(vehicle, source_sequence=result.source_sequence),
                                     captured_at=result.captured_at
                                 )
                             except Exception as exc:
@@ -325,6 +327,11 @@ def _write_status_json(status_file: str, coordinator, analyzers, consumer, clip_
             "capture_fps": float(round(cam.capture_fps, 2)),
             "inference_fps": float(round(cam.actual_inference_fps, 2)),
             "frame_age_seconds": float(round(now - cam.last_inference_at, 3)) if cam.last_inference_at > 0 else None,
+            "vehicle_detections_last_frame": cam.detections_count,
+            "crossings": cam.crossing_candidates,
+            "events_published": cam.events_published,
+            "events_dropped": cam.event_queue_dropped,
+            "inference_ms": cam.inference_ms_last,
             "active_tracks": int(len(cam.active_track_ids)),
             "last_event_type": last_event_type,
             "last_plate": last_plate,
@@ -352,6 +359,7 @@ def _write_status_json(status_file: str, coordinator, analyzers, consumer, clip_
         "visits_open": int(visits_open),
         "review_pending": int(review_pending),
         "ocr_completed": int(ocr_completed),
+        "ocr_session_counts": cons_status.ocr_counts,
         "clip_jobs_pending": int(clip_pending),
         "cameras": camera_data
     }

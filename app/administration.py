@@ -146,6 +146,7 @@ EVENT_SELECT = '''SELECT e.*, e.plate AS plate_original, p.plate_manual,
 def event_dict(row):
     value = dict(row)
     value['plate'] = value['plate_effective']
+    value['verification_status'] = 'CORREGIDA_MANUALMENTE' if value['plate_manual'] else value['plate_status']
     value['visit_status'] = 'COMPLETED' if value['visit_id'] else None
     return value
 

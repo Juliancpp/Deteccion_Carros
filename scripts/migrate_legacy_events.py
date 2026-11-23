@@ -90,7 +90,7 @@ def migrate(legacy_path=None, hotel_path=None, backup_dir=None):
                 duplicates += 1
                 continue
             event_id = f"legacy-{source_id}"
-            status = "LEIDA" if plate else "NO_LEGIBLE"
+            status = "PROBABLE" if plate else "NO_LEGIBLE"
             event_type = classify(row["camara"], row["tipo_evento"])
             note = "Importado desde eventos.db"
             if event_type == "EVENTO_NO_RESUELTO":
@@ -104,7 +104,7 @@ def migrate(legacy_path=None, hotel_path=None, backup_dir=None):
                 (event_id, row["fecha_hora"].replace(" ", "T"), row["camara"], row["camara"],
                  int(row["vehicle_id"]), row["tipo_evento"], float(row["confianza_ocr"] or 0),
                  event_type, plate, float(row["confianza_ocr"] or 0), status, "[]", None,
-                 0.0, "NO_DETERMINADA", "legacy", 0.0, row["imagen"], 1 if not plate or event_type == "EVENTO_NO_RESUELTO" else 0,
+                 0.0, "NO_DETERMINADA", "legacy", 0.0, row["imagen"], 1,
                  note, "DISABLED", "legacy_eventos", source_id))
             inserted += 1
         target.commit()
