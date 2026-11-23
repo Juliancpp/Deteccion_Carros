@@ -1,4 +1,5 @@
 from __future__ import annotations
+from app.hotel import visits
 
 import os
 import tempfile
@@ -53,14 +54,16 @@ class HotelExcelExporter:
             "Estado habitacion", "Clase vehiculo", "Evidencia", "Revision requerida", "Observaciones",
         ]
         rows = []
+        corrections = dict(self.store.conn.execute("SELECT event_id,plate_manual FROM event_plate_corrections"))
+        headers.extend(["Placa OCR original","Placa corregida"])
         for event in self.store.list_events():
             occurred = parse_dt(event["occurred_at"]) or dt_class.now()
             rows.append([
                 event["event_id"], occurred.date(), occurred.time().replace(microsecond=0), event["camera_id"],
-                event["track_id"], event["movement"], event["event_type"], event["plate"] or "",
+                event["track_id"], event["movement"], event["event_type"], corrections.get(event["event_id"],event["plate"]) or "",
                 event["plate_confidence"], event["plate_status"], event["room_number"] or "",
                 event["room_confidence"], event["room_status"], event["vehicle_class"],
-                event["evidence_path"] or "", bool(event["review_required"]), event["notes"],
+                event["evidence_path"] or "", bool(event["review_required"]), event["notes"], event["plate"] or "", corrections.get(event["event_id"],""),
             ])
         _write_table(ws, headers, rows)
 
@@ -71,12 +74,12 @@ class HotelExcelExporter:
             "Estado", "Revision requerida",
         ]
         rows = []
-        for visit in self.store.list_visits():
+        for visit in visits.export_rows(self.store.conn):
             entry_at = parse_dt(visit["entry_at"])
             exit_at = parse_dt(visit["exit_at"])
             duration = ""
             if entry_at and exit_at:
-                duration = round((exit_at - entry_at).total_seconds() / 60, 1)
+                duration = round((visits.epoch(exit_at) - visits.epoch(entry_at)) / 60, 1)
                 
             rows.append([
                 visit["visit_id"], visit["plate"], visit["entry_at"] or "", visit["entry_camera"] or "",

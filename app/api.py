@@ -12,9 +12,9 @@ import hashlib
 import time
 from datetime import datetime
 from pathlib import Path
-from typing import Optional
+from typing import Annotated, Optional
 
-from fastapi import Query, FastAPI, Depends, HTTPException, Request, Response
+from fastapi import Header, Query, FastAPI, Depends, HTTPException, Request, Response
 from fastapi.responses import FileResponse, HTMLResponse
 from fastapi.staticfiles import StaticFiles
 from dotenv import load_dotenv
@@ -30,6 +30,7 @@ from app.database import DatabaseManager
 from app.hotel.store import HotelStore
 from app.export.excel_exporter import HotelExcelExporter
 from app.runtime import is_valid_jpeg, runtime_snapshot_path, snapshot_info, validate_runtime_camera
+from app.hotel import visits as canonical
 from app import administration as admin
 from contextlib import asynccontextmanager
 from fastapi.responses import RedirectResponse
@@ -253,7 +254,7 @@ def get_hotel_summary(month: Optional[str] = None, authenticated: dict = Depends
     try:
         if month and (len(month) != 7 or month[4] != '-' or not month[:4].isdigit() or not month[5:].isdigit()):
             raise HTTPException(422, "month debe tener formato YYYY-MM")
-        return {**store.get_summary_stats(), **admin.summary(month=month)}
+        return {**store.get_summary_stats(), **manual_operation(admin.summary,month)}
     finally:
         store.close()
 
@@ -323,15 +324,8 @@ def get_hotel_events(
     with admin.connection() as c:
         rows = admin.events(c)
     if month:
-        if len(month) != 7 or month[4] != '-' or not month[:4].isdigit() or not month[5:].isdigit():
-            raise HTTPException(422, "month debe tener formato YYYY-MM")
-        year, mon = map(int, month.split('-'))
-        if not 1 <= mon <= 12: raise HTTPException(422, "month inválido")
-        end = f"{year + (mon == 12):04d}-{1 if mon == 12 else mon + 1:02d}-01"
-        # Events are stored as ISO strings, sometimes naive and sometimes offset-aware;
-        # matching the YYYY-MM prefix avoids lexical/timezone edge cases while keeping
-        # the selected calendar month deterministic.
-        rows = [e for e in rows if (e.get("occurred_at") or '').startswith(month)]
+        _, (start, end) = manual_operation(canonical.query,None,month)
+        rows = [e for e in rows if start <= canonical.epoch(e["occurred_at"]) < end]
     if date_from:
         rows = [e for e in rows if e["occurred_at"] >= date_from]
     if date_to:
@@ -419,6 +413,9 @@ def post_hotel_export(authenticated: bool = Depends(check_auth)):
         store.close()
 
 
+CommandKey = Annotated[Optional[str], Header(alias="Idempotency-Key", min_length=1, max_length=128)]
+
+
 class AssociationPayload(BaseModel):
     model_config = {"extra": "forbid"}
     entry_event_id: str = Field(min_length=1, max_length=128)
@@ -426,37 +423,207 @@ class AssociationPayload(BaseModel):
 
 
 @app.post("/api/hotel/visits/associate")
-def associate_visit(payload: AssociationPayload, authenticated: dict = Depends(check_auth)):
-    visit = manual_operation(admin.associate, payload.entry_event_id, payload.exit_event_id, authenticated)
+def associate_visit(
+    payload: AssociationPayload, authenticated: dict = Depends(check_auth), token: CommandKey = None
+):
+    visit = manual_operation(
+        admin.associate, payload.entry_event_id, payload.exit_event_id, authenticated, token
+    )
     return {"success": True, "visit": visit}
 
 
 @app.get("/api/hotel/visits")
-def get_hotel_visits(page: int = 1, page_size: int = 25, authenticated: dict = Depends(check_auth)):
+def get_hotel_visits(
+    page: int = 1, page_size: int = 25, authenticated: dict = Depends(check_auth), month: Optional[str] = None
+):
     page, page_size = max(1, page), max(1, min(page_size, 100))
     with admin.connection() as c:
-        total = c.execute("SELECT count(*) FROM manual_visits").fetchone()[0]
-        visits = [dict(r) for r in c.execute("SELECT * FROM manual_visits ORDER BY id DESC LIMIT ? OFFSET ?",
-                                           (page_size, (page-1)*page_size))]
+        c.execute("BEGIN")
+        sql, args = manual_operation(canonical.query, "visits_completed", month)
+        total = c.execute("SELECT count(*)" + sql, args).fetchone()[0]
+        visits = [
+            dict(r)
+            for r in c.execute(
+                "SELECT association_id AS id,id AS canonical_id,entry_event_id,exit_event_id,'COMPLETED' AS status,linked_by_user_id,linked_at,linked_at AS created_at,linked_at AS updated_at"
+                + sql
+                + " ORDER BY instant DESC,id LIMIT ? OFFSET ?",
+                [*args, page_size, (page - 1) * page_size],
+            )
+        ]
         for v in visits:
             v["entry"] = enrich_event(admin.event(c, v["entry_event_id"]))
             v["exit"] = enrich_event(admin.event(c, v["exit_event_id"]))
-    return {"visits": visits, "total": total, "page": page, "pages": (total+page_size-1)//page_size}
+    return {"visits": visits, "total": total, "page": page, "pages": (total + page_size - 1) // page_size}
+
+
+@app.get("/api/hotel/visit-cases/indicators")
+def visit_indicators(month: Optional[str] = None, authenticated: dict = Depends(check_auth)):
+    with admin.connection() as c:
+        c.execute("BEGIN")
+        return manual_operation(canonical.indicators, c, month)
+
+
+def canonical_item(c, row):
+    item = dict(row)
+    item.update(
+        state=canonical.state(row),
+        plate_original=row["plate"],
+        plate=row["plate_manual"] or row["plate"],
+        identification_status="CORREGIDA_MANUALMENTE" if row["plate_manual"] else row["plate_status"],
+    )
+    return item
+
+
+@app.get("/api/hotel/visit-cases")
+def visit_cases(
+    category: Optional[str] = None,
+    month: Optional[str] = None,
+    page: int = Query(1, ge=1),
+    page_size: int = Query(25, ge=1, le=100),
+    authenticated: dict = Depends(check_auth),
+):
+    sql, args = manual_operation(canonical.query, category, month)
+    with admin.connection() as c:
+        c.execute("BEGIN")
+        total = c.execute("SELECT count(*)" + sql, args).fetchone()[0]
+        rows = c.execute(
+            "SELECT *" + sql + " ORDER BY instant DESC,id LIMIT ? OFFSET ?",
+            [*args, page_size, (page - 1) * page_size],
+        )
+        items = [
+            canonical_item(c, canonical.case(c, r["id"]) if category == "review_pending" else r)
+            if r["kind"] != "room_review"
+            else dict(r, state="HABITACION_SIN_ASIGNAR")
+            for r in rows
+        ]
+        return dict(visits=items, total=total, page=page, page_size=page_size)
+
+
+@app.get("/api/hotel/visit-cases/{key}")
+def visit_case(key: str, authenticated: dict = Depends(check_auth)):
+    with admin.connection() as c:
+        c.execute("BEGIN")
+        if key.startswith("room-review:"):
+            room_id = key.removeprefix("room-review:")
+            rooms = c.execute(
+                """SELECT * FROM visit_rooms WHERE visit_id IS NULL AND (camera,session,track) IN
+                            (SELECT camera,session,track FROM visit_rooms WHERE id=? AND visit_id IS NULL)
+                            ORDER BY instant,id""",
+                (room_id,),
+            ).fetchall()
+            if not rooms:
+                raise HTTPException(404, "Observación inexistente")
+            return dict(
+                id=key,
+                state="HABITACION_SIN_ASIGNAR",
+                rooms=[dict(x, evidence_url=_relative_evidence_url(x["evidence_path"])) for x in rooms],
+            )
+        r = manual_operation(canonical.case, c, key)
+        item = canonical_item(c, r)
+        ids = list(dict.fromkeys(x for x in (key, r["exit_event_id"]) if x))
+        item["events"] = [enrich_event(admin.event(c, x)) for x in ids]
+        anchor_evidence = item["evidence_path"]
+        item["rooms"] = [
+            dict(
+                x,
+                evidence_url=_relative_evidence_url(
+                    x["evidence_path"] or (anchor_evidence if x["evidence_event"] == key else None)
+                ),
+            )
+            for x in c.execute("SELECT * FROM visit_rooms WHERE visit_id=? ORDER BY instant,id", (key,))
+        ]
+        item["history"] = [
+            dict(x)
+            for x in c.execute(
+                "SELECT * FROM visit_history WHERE visit_id IN (?,?) ORDER BY id", (key, r["exit_event_id"])
+            )
+        ]
+        item["corrections"] = [
+            dict(x)
+            for x in c.execute(
+                "SELECT * FROM audit_log WHERE entity_type='event' AND entity_id IN (?,?) ORDER BY id",
+                (key, r["exit_event_id"]),
+            )
+        ]
+        return item
+
+
+class RoomPayload(BaseModel):
+    room_number: int = Field(gt=0)
+
+
+class ExceptionalPayload(BaseModel):
+    reason: str = Field(min_length=1, max_length=512)
+
+
+def case_write(actor, function, *args, token=None):
+    with admin.connection() as c, c:
+        c.execute("BEGIN IMMEDIATE")
+        manual_operation(
+            canonical.command, c, actor, token, [function.__name__, *args], lambda: function(c, *args)
+        )
+    return {"success": True}
+
+
+@app.patch("/api/hotel/visit-cases/{key}/room")
+def correct_visit_room(
+    key: str, payload: RoomPayload, authenticated: dict = Depends(check_auth), token: CommandKey = None
+):
+    return case_write(authenticated["id"], canonical.change_room, key, payload.room_number, authenticated["id"], token=token)
+
+
+@app.post("/api/hotel/visit-cases/{key}/room-observations/{observation}")
+def link_room_observation(
+    key: str, observation: int, authenticated: dict = Depends(check_auth), token: CommandKey = None
+):
+    return case_write(authenticated["id"], canonical.link_room, key, observation, authenticated["id"], token=token)
+
+
+@app.patch("/api/hotel/visit-cases/{key}/plate")
+def correct_visit_plate(
+    key: str, payload: PlatePayload, authenticated: dict = Depends(check_auth), token: CommandKey = None
+):
+    return {
+        "success": True,
+        "event": manual_operation(admin.correct_plate, key, payload.plate, authenticated, True, token),
+    }
+
+
+@app.post("/api/hotel/visit-cases/{key}/review")
+def confirm_visit_review(key: str, authenticated: dict = Depends(check_auth), token: CommandKey = None):
+    return case_write(authenticated["id"], canonical.review, key, authenticated["id"], token=token)
+
+
+@app.post("/api/hotel/visit-cases/{key}/exceptional-close")
+def close_visit_exceptionally(
+    key: str, payload: ExceptionalPayload, authenticated: dict = Depends(check_auth), token: CommandKey = None
+):
+    if authenticated["role"] != "admin":
+        raise HTTPException(403, "Requiere administración")
+    if not payload.reason.strip():
+        raise HTTPException(422, "Se requiere un motivo")
+    return case_write(authenticated["id"], canonical.exceptional, key, authenticated["id"], payload.reason.strip(), token=token)
 
 
 @app.get("/api/hotel/visits/{visit_id}")
 def get_hotel_visit_detail(visit_id: int, authenticated: dict = Depends(check_auth)):
     with admin.connection() as c:
-        row = c.execute("SELECT * FROM manual_visits WHERE id=?", (visit_id,)).fetchone()
+        row = c.execute(
+            "SELECT *,entry_event_id AS canonical_id,'COMPLETED' AS status,CASE WHEN origin IN ('manual','historical_manual') THEN CAST(actor AS INTEGER) END linked_by_user_id,created_at AS linked_at,created_at AS updated_at FROM visit_links WHERE revoked_at IS NULL AND id=?",
+            (visit_id,),
+        ).fetchone()
         if not row:
             raise HTTPException(404, "Visita no encontrada.")
-        return {**dict(row), "entry": enrich_event(admin.event(c, row["entry_event_id"])),
-                "exit": enrich_event(admin.event(c, row["exit_event_id"]))}
+        return {
+            **dict(row),
+            "entry": enrich_event(admin.event(c, row["entry_event_id"])),
+            "exit": enrich_event(admin.event(c, row["exit_event_id"])),
+        }
 
 
 @app.delete("/api/hotel/visits/{visit_id}/association")
-def unlink_visit(visit_id: int, authenticated: dict = Depends(check_auth)):
-    manual_operation(admin.unlink, visit_id, authenticated)
+def unlink_visit(visit_id: int, authenticated: dict = Depends(check_auth), token: CommandKey = None):
+    manual_operation(admin.unlink, visit_id, authenticated, token)
     return {"success": True}
 
 

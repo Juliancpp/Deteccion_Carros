@@ -11,6 +11,7 @@ import time
 from argon2 import PasswordHasher
 from argon2.exceptions import VerificationError, InvalidHashError
 
+from app.hotel import visits
 from app import config
 
 PASSWORDS = PasswordHasher()
@@ -140,7 +141,7 @@ EVENT_SELECT = '''SELECT e.*, e.plate AS plate_original, p.plate_manual,
     p.corrected_by_user_id AS plate_corrected_by_user_id,p.corrected_at AS plate_corrected_at,
     v.id AS visit_id FROM hotel_vehicle_events e
     LEFT JOIN event_plate_corrections p ON p.event_id=e.event_id
-    LEFT JOIN manual_visits v ON v.entry_event_id=e.event_id OR v.exit_event_id=e.event_id'''
+    LEFT JOIN visit_links v ON v.revoked_at IS NULL AND (v.entry_event_id=e.event_id OR v.exit_event_id=e.event_id)'''
 
 
 def event_dict(row):
@@ -167,86 +168,145 @@ def audit(c, user_id, action, entity, entity_id, old, new):
               (user_id, action, entity, str(entity_id), json.dumps(old, ensure_ascii=False), json.dumps(new, ensure_ascii=False), now()))
 
 
-def correct_plate(event_id, plate, user):
+def correct_plate(event_id, plate, user, require_case=False, token=None):
     plate = normalize_plate(plate)
     with connection() as c, c:
-        c.execute('BEGIN IMMEDIATE')
-        original = event(c, event_id)
-        c.execute('''INSERT INTO event_plate_corrections VALUES(?,?,?,?) ON CONFLICT(event_id)
-            DO UPDATE SET plate_manual=excluded.plate_manual,corrected_by_user_id=excluded.corrected_by_user_id,
-            corrected_at=excluded.corrected_at''', (event_id, plate, user['id'], now()))
-        audit(c, user['id'], 'PLATE_CHANGED', 'event', event_id, original['plate'], plate)
+        c.execute("BEGIN IMMEDIATE")
+        visits.command(
+            c,
+            user["id"],
+            token,
+            ["plate", event_id, plate, require_case],
+            lambda: _correct_plate(c, event_id, plate, user, require_case),
+        )
         return event(c, event_id)
 
 
+def _correct_plate(c, event_id, plate, user, require_case):
+    if require_case:
+        visits.case(c, event_id)
+    original = event(c, event_id)
+    if original["plate_manual"] == plate:
+        return
+    c.execute(
+        """INSERT INTO event_plate_corrections VALUES(?,?,?,?) ON CONFLICT(event_id)
+        DO UPDATE SET plate_manual=excluded.plate_manual,corrected_by_user_id=excluded.corrected_by_user_id,
+        corrected_at=excluded.corrected_at""",
+        (event_id, plate, user["id"], now()),
+    )
+    owner = c.execute(
+        "SELECT entry_event_id FROM visit_links WHERE revoked_at IS NULL AND exit_event_id=?", (event_id,)
+    ).fetchone()
+    if c.execute("SELECT 1 FROM visit_cases WHERE id=?", (event_id,)).fetchone():
+        visits.record(c, owner[0] if owner else event_id, "PLACA_CORREGIDA", user["id"], event_id=event_id)
+    audit(c, user["id"], "PLATE_CHANGED", "event", event_id, original["plate"], plate)
+
+
 def timestamp(value):
-    dt = datetime.fromisoformat(value)
-    # Existing naive timestamps use server local time; aware timestamps retain their offset.
-    return dt.timestamp()
+    return visits.epoch(value)
 
 
 def unpaired(kind, entry_id=None):
     with connection() as c:
-        candidates = [e for e in events(c) if not e['visit_id'] and e['event_type'] in (ENTRY_TYPES if kind == 'entries' else EXIT_TYPES)]
+        candidates = [
+            e
+            for e in events(c)
+            if not e["visit_id"] and e["event_type"] in (ENTRY_TYPES if kind == "entries" else EXIT_TYPES)
+        ]
         if entry_id:
             entry = event(c, entry_id)
-            if entry['event_type'] not in ENTRY_TYPES or entry['visit_id']:
-                raise ValueError('La entrada no está disponible.')
-            candidates = [e for e in candidates if timestamp(e['occurred_at']) >= timestamp(entry['occurred_at'])]
+            if entry["event_type"] not in ENTRY_TYPES or entry["visit_id"]:
+                raise ValueError("La entrada no está disponible.")
+            candidates = [
+                e for e in candidates if timestamp(e["occurred_at"]) >= timestamp(entry["occurred_at"])
+            ]
+
             def rank(e):
-                a, b = entry['plate'] or '', e['plate'] or ''
-                a, b = a.replace('-', '').replace(' ', '').upper(), b.replace('-', '').replace(' ', '').upper()
+                a, b = entry["plate"] or "", e["plate"] or ""
+                a, b = (
+                    a.replace("-", "").replace(" ", "").upper(),
+                    b.replace("-", "").replace(" ", "").upper(),
+                )
                 similarity = SequenceMatcher(None, a, b).ratio() if a and b else 0
-                return (0 if a and a == b else 1 if similarity >= .7 else 2,
-                        -similarity if similarity >= .7 else 0, timestamp(e['occurred_at']), e['event_id'])
+                return (
+                    0 if a and a == b else 1 if similarity >= 0.7 else 2,
+                    -similarity if similarity >= 0.7 else 0,
+                    timestamp(e["occurred_at"]),
+                    e["event_id"],
+                )
+
             candidates.sort(key=rank)
         return candidates
 
 
-def associate(entry_id, exit_id, user):
+def associate(entry_id, exit_id, user, token=None):
     with connection() as c, c:
-        c.execute('BEGIN IMMEDIATE')
-        entry, departure = event(c, entry_id), event(c, exit_id)
-        if entry['event_type'] not in ENTRY_TYPES or departure['event_type'] not in EXIT_TYPES:
-            raise ValueError('Selecciona una entrada y una salida reales.')
-        if entry['visit_id'] or departure['visit_id']:
-            raise FileExistsError('Uno de los eventos ya está asociado. Desasocia primero.')
-        if timestamp(departure['occurred_at']) < timestamp(entry['occurred_at']):
-            raise ValueError('La salida no puede ser anterior a la entrada.')
-        date = now()
-        cur = c.execute('''INSERT INTO manual_visits(entry_event_id,exit_event_id,linked_by_user_id,linked_at,created_at,updated_at)
-                           VALUES(?,?,?,?,?,?)''', (entry_id, exit_id, user['id'], date, date, date))
-        visit = dict(c.execute('SELECT * FROM manual_visits WHERE id=?', (cur.lastrowid,)).fetchone())
-        audit(c, user['id'], 'VISIT_LINKED', 'visit', visit['id'], None, visit)
-        return visit
+        c.execute("BEGIN IMMEDIATE")
+        return visits.command(
+            c,
+            user["id"],
+            token,
+            ["associate", entry_id, exit_id],
+            lambda: _associate(c, entry_id, exit_id, user),
+        )
 
 
-def unlink(visit_id, user):
+def _associate(c, entry_id, exit_id, user):
+    entry, departure = event(c, entry_id), event(c, exit_id)
+    if entry["event_type"] not in ENTRY_TYPES or departure["event_type"] not in EXIT_TYPES:
+        raise ValueError("Selecciona una entrada y una salida reales.")
+    if entry["visit_id"] and entry["visit_id"] == departure["visit_id"]:
+        return dict(
+            id=entry["visit_id"],
+            canonical_id=entry_id,
+            status="COMPLETED",
+            entry_event_id=entry_id,
+            exit_event_id=exit_id,
+        )
+    association = visits.link(c, entry_id, exit_id, "manual", user["id"])
+    visit = dict(
+        c.execute("SELECT * FROM visit_links WHERE id=?", (association,)).fetchone(),
+        status="COMPLETED",
+        canonical_id=entry_id,
+    )
+    audit(c, user["id"], "VISIT_LINKED", "visit", visit["id"], None, visit)
+    return visit
+
+
+def unlink(visit_id, user, token=None):
     with connection() as c, c:
-        c.execute('BEGIN IMMEDIATE')
-        row = c.execute('SELECT * FROM manual_visits WHERE id=?', (visit_id,)).fetchone()
-        if not row:
-            raise LookupError('Visita no encontrada.')
-        audit(c, user['id'], 'VISIT_UNLINKED', 'visit', visit_id, dict(row), None)
-        c.execute('DELETE FROM manual_visits WHERE id=?', (visit_id,))
+        c.execute("BEGIN IMMEDIATE")
+        return visits.command(c, user["id"], token, ["unlink", visit_id], lambda: _unlink(c, visit_id, user))
+
+
+def _unlink(c, visit_id, user):
+    row = c.execute("SELECT * FROM visit_links WHERE id=?", (visit_id,)).fetchone()
+    if not row:
+        raise LookupError("Visita no encontrada.")
+    if row["revoked_at"] is not None:
+        return
+    visits.detach(c, visit_id, user["id"])
+    audit(c, user["id"], "VISIT_UNLINKED", "visit", visit_id, dict(row), None)
 
 
 def summary(month=None, rows=None):
     with connection() as c:
-        all_events = rows if rows is not None else events(c)
-        if month:
-            start = f"{month}-01"
-            year, mon = map(int, month.split('-'))
-            end = f"{year + (mon == 12):04d}-{1 if mon == 12 else mon + 1:02d}-01"
-            all_events = [e for e in all_events if start <= (e.get('occurred_at') or '') < end]
-        entries = [e for e in all_events if e['event_type'] in ENTRY_TYPES]
-        exits = [e for e in all_events if e['event_type'] in EXIT_TYPES]
-        visit_count = c.execute('''SELECT count(*) FROM manual_visits v JOIN hotel_vehicle_events e
-                                   ON e.event_id=v.entry_event_id WHERE ? IS NULL OR (e.occurred_at>=? AND e.occurred_at<?)''',
-                                (month, f"{month}-01" if month else '', end if month else '')).fetchone()[0]
-        return dict(entries=len(entries), exits=len(exits),
-                    visits_completed=visit_count,
-                    entries_unpaired=sum(not e['visit_id'] for e in entries),
-                    exits_unpaired=sum(not e['visit_id'] for e in exits),
-                    review_pending=sum(bool(e.get('review_required')) for e in all_events),
-                    month=month, scope='month' if month else 'all_history')
+        c.execute("BEGIN")
+        sql, args = visits.query(None, month)
+        totals = dict(c.execute("SELECT kind,count(*)" + sql + " GROUP BY kind", args))
+        # Linked departures are hidden from the case list but still count as legacy events.
+        time_filter = " WHERE instant>=? AND instant<?" if month else ""
+        exits = c.execute(
+            "SELECT count(*) FROM visit_cases"
+            + time_filter
+            + (" AND" if month else " WHERE")
+            + " kind='exit'",
+            args,
+        ).fetchone()[0]
+        return dict(
+            entries=totals.get("entry", 0),
+            exits=exits,
+            **visits.indicators(c, month),
+            month=month,
+            scope="month" if month else "all_history",
+        )
