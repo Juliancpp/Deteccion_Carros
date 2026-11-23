@@ -7,7 +7,7 @@ import time
 import uuid
 from collections import deque
 from datetime import datetime, timezone
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, Callable
 
 from app import config
@@ -362,7 +362,15 @@ class MultiCameraCoordinator:
             height, width = frame.shape[:2]
             events = geometry.update(tracked, width, height, latest.captured_at, latest.sequence, now)
             if events and self.geometry_sink is not None:
-                self.geometry_sink(events)
+                batch = []
+                for event in events:
+                    if event.event_type == "ROOM_ENTRY":
+                        vehicle = _vehicle_by_track_id(tracked, event.track_id)
+                        if vehicle:
+                            from app.safety import safe_crop
+                            event = replace(event, evidence_image=safe_crop(frame,vehicle["bbox"],padding=12).crop)
+                    batch.append(event)
+                self.geometry_sink(batch)
             if geometry.layout.use_for_visits:
                 for event in events:
                     if event.event_type not in {"HOTEL_ENTRY", "HOTEL_EXIT"}:
@@ -443,7 +451,8 @@ class MultiCameraCoordinator:
         frame_copy = frame.copy() if config.EVENT_FRAME_COPY_ENABLED else None
         x1, y1, x2, y2 = [int(value) for value in vehicle["bbox"]]
         return EventCandidate(
-            event_id=str(uuid.uuid4()),
+            event_id=str(uuid.uuid5(uuid.NAMESPACE_URL, repr((context.camera_id, confirmation.occurred_at.isoformat(),
+                    confirmation.direction, (x1,y1,x2,y2), tuple(confirmation.track_point))))),
             camera_id=context.camera_id,
             camera_name=context.camera_name,
             track_id=confirmation.track_id,

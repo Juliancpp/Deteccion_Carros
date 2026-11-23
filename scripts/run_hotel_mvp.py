@@ -2,6 +2,9 @@
 from __future__ import annotations
 
 import logging
+import uuid
+from dataclasses import replace
+import cv2
 import argparse
 import os
 import resource
@@ -255,7 +258,19 @@ def main() -> int:
 def _flush_geometry(store, pending):
     # Only the scheduler appends and only the runner removes committed batches.
     for _ in range(len(pending)):
-        store.save_geometry_events(pending[0])
+        batch = []
+        for event in pending[0]:
+            if getattr(event, "evidence_image", None) is not None:
+                identity = repr((event.camera_id,event.occurred_at.isoformat(),event.track_id,event.feature_id))
+                name = uuid.uuid5(uuid.NAMESPACE_URL,identity).hex + ".jpg"
+                path = os.path.join(config.CAPTURE_DIR,event.camera_id,event.occurred_at.date().isoformat(),name)
+                try:
+                    if atomic_write_jpeg(path,event.evidence_image):
+                        event = replace(event,evidence_path=path)
+                except (OSError, cv2.error):
+                    logging.getLogger(__name__).warning("room_evidence_failed camera=%s",event.camera_id)
+            batch.append(event)
+        store.save_geometry_events(batch)
         pending.popleft()
 
 

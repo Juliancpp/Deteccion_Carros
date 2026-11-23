@@ -9,6 +9,7 @@ from datetime import datetime
 from typing import List
 
 from sqlalchemy import Column, DateTime, Float, Integer, String, create_engine, select
+from sqlalchemy.dialects.sqlite import insert
 from sqlalchemy.orm import declarative_base, sessionmaker
 
 try:
@@ -27,6 +28,7 @@ class EventRecord(Base):
 
     id = Column(Integer, primary_key=True, autoincrement=True)
     fecha_hora = Column(DateTime, nullable=False, index=True)
+    source_event_id = Column(String(128), nullable=True)
     placa = Column(String(16), nullable=True)
     confianza_ocr = Column(Float, nullable=True)
     tipo_evento = Column(String(20), nullable=False)
@@ -49,7 +51,13 @@ class DatabaseManager:
             future=True
         )
         self.Session = sessionmaker(bind=self.engine, future=True)
-        Base.metadata.create_all(self.engine)
+        with self.engine.begin() as conn:
+            conn.exec_driver_sql("BEGIN IMMEDIATE")
+            Base.metadata.create_all(conn)
+            columns = {row[1] for row in conn.exec_driver_sql("PRAGMA table_info(eventos)")}
+            if "source_event_id" not in columns:
+                conn.exec_driver_sql("ALTER TABLE eventos ADD COLUMN source_event_id TEXT")
+            conn.exec_driver_sql("CREATE UNIQUE INDEX IF NOT EXISTS eventos_source ON eventos(source_event_id)")
 
         # Habilitar modo WAL y configuraciones de sincronización optimizadas para SQLite multihilo
         with self.engine.connect() as conn:
@@ -70,7 +78,8 @@ class DatabaseManager:
                 "image_path": "...jpg"
             }
         """
-        record = EventRecord(
+        values = dict(
+            source_event_id=event.get("source_event_id"),
             fecha_hora=self._parse_timestamp(event.get("timestamp")),
             placa=event.get("plate") or event.get("placa") or None,
             confianza_ocr=self._parse_confidence(
@@ -83,10 +92,12 @@ class DatabaseManager:
         )
 
         with self.Session() as session:
-            session.add(record)
+            result = session.execute(insert(EventRecord.__table__).values(**values).on_conflict_do_nothing(
+                index_elements=["source_event_id"]))
+            key = result.lastrowid if result.rowcount else session.scalar(
+                select(EventRecord.id).where(EventRecord.source_event_id == values["source_event_id"]))
             session.commit()
-            session.refresh(record)
-            return int(record.id)
+            return int(key)
 
     def get_events(self, limit: int = 50) -> List[dict]:
         """Devuelve los últimos eventos ordenados del más reciente al más antiguo."""

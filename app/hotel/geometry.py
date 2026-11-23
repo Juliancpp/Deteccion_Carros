@@ -197,6 +197,8 @@ class GeometryEvent:
     occurred_at: datetime
     feature_id: str
     event_type: str
+    evidence_image: object = field(default=None, compare=False, repr=False)
+    evidence_path: str | None = None
 
 
 class GeometryDetector:

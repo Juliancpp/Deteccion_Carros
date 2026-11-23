@@ -71,3 +71,5 @@ class HotelVehicleEvent:
     review_reasons_json: str | None = None
     source: str = "mvp_hotel"
     ocr_diagnostics_json: str | None = None
+    capture_session: str | None = None
+    physical_track_id: int | None = None

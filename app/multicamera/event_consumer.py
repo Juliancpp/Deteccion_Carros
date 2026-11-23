@@ -396,6 +396,13 @@ class MultiCameraEventConsumer:
 
     def _process_resolved_candidate(self, candidate: EventCandidate, track_result: Optional[Any]) -> None:
         """Valida, ejecuta OCR (con votación multiframe), guarda evidencia y persiste los resultados."""
+        existing = self.hotel_store.get_event(candidate.event_id) if self.hotel_store else None
+        if existing is not None:
+            if self.db_manager:
+                self.db_manager.save_event(dict(source_event_id=candidate.event_id,timestamp=existing["occurred_at"],
+                    plate=existing["plate"],confidence=existing["plate_confidence"],type=existing["movement"],
+                    vehicle_id=existing["track_id"],image_path=existing["evidence_path"],camera=existing["camera_id"]))
+            return
         start_time = time.perf_counter()
         success = False
         is_invalid = False
@@ -544,6 +551,7 @@ class MultiCameraEventConsumer:
                 try:
                     db_event = {
                         "timestamp": candidate.captured_at,
+                        "source_event_id": candidate.event_id,
                         "plate": plate_text,
                         "confidence": plate_confidence,
                         "type": movement,
@@ -565,7 +573,7 @@ class MultiCameraEventConsumer:
             if self.hotel_store:
                 try:
                     hotel_event = HotelVehicleEvent(
-                        event_id=candidate.event_id if candidate.session_id or candidate.geometry_gate else f"{candidate.camera_id}-{logical_id}-{candidate.captured_at.strftime('%H%M%S')}",
+                        event_id=candidate.event_id,
                         occurred_at=candidate.captured_at,
                         camera_id=candidate.camera_id,
                         camera_name=candidate.camera_name,
@@ -586,6 +594,8 @@ class MultiCameraEventConsumer:
                         notes=notes,
                         source="geometry_gate" if candidate.geometry_gate else "mvp_hotel",
                         plate_supporting_frames_json=json.dumps(voted_res.get("supporting_frame_ids", ())),
+                        capture_session=candidate.session_id,
+                        physical_track_id=candidate.track_id,
                         logical_vehicle_id=logical_id,
                         original_track_ids_json=json.dumps(sorted(linked_track_ids)),
                         review_reasons_json=json.dumps(voted_res["review_reasons"]),

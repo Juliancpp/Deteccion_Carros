@@ -3,10 +3,10 @@ from __future__ import annotations
 import json
 import os
 import sqlite3
-import uuid
 import math
 from datetime import datetime
 
+from app.hotel import visits
 from app.hotel.models import HotelVehicleEvent
 
 
@@ -16,9 +16,12 @@ class HotelStore:
         os.makedirs(os.path.dirname(db_path), exist_ok=True)
         self.conn = sqlite3.connect(db_path, check_same_thread=False)
         self.conn.row_factory = sqlite3.Row
+        self.conn.execute("PRAGMA foreign_keys=ON")
         self._init_schema()
+        self.conn.executescript(visits.SCHEMA)
 
     def save_geometry_events(self, events):
+        events = list(events)
         with self.conn:
             self.conn.executemany(
                 """INSERT INTO geometry_events
@@ -27,6 +30,9 @@ class HotelStore:
                 [(e.session_id, e.camera_id, e.track_id, e.source_sequence, e.occurred_at.isoformat(),
                   e.feature_id, e.event_type) for e in events],
             )
+
+            for event in events:
+                visits.geometry(self.conn, event)
 
     def close(self) -> None:
         self.conn.close()
@@ -177,12 +183,11 @@ class HotelStore:
         room_vote_margin = getattr(event, "room_vote_margin", 0.0)
         review_reasons_json = getattr(event, "review_reasons_json", None)
 
-        insert = "INSERT" if event.source == "geometry_gate" else "INSERT OR REPLACE"
-        conflict = "ON CONFLICT(event_id) DO NOTHING" if event.source == "geometry_gate" else ""
+
         with self.conn:
             cursor = self.conn.execute(
                 f"""
-                {insert} INTO hotel_vehicle_events (
+                INSERT INTO hotel_vehicle_events (
                     event_id, occurred_at, camera_id, camera_name, track_id, movement, movement_confidence, event_type,
                     plate, plate_confidence, plate_status, plate_candidates, room_number,
                     room_confidence, room_status, vehicle_class, vehicle_confidence, evidence_path,
@@ -192,7 +197,7 @@ class HotelStore:
                     plate_vote_margin, plate_supporting_frames_json, room_score_breakdown_json,
                     room_runner_up, room_vote_margin, review_reasons_json, source, source_event_id, ocr_diagnostics_json
                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                {conflict}
+                ON CONFLICT(event_id) DO NOTHING
                 """,
                 (
                     event.event_id,
@@ -239,67 +244,31 @@ class HotelStore:
                 ),
             )
             if cursor.rowcount:
-                self._update_visit(event)
-
-
-    def _update_visit(self, event: HotelVehicleEvent) -> None:
-        if not _eligible_for_visit(event):
-            return
-        open_visit = self.get_open_visit(event.plate)
-        if event.event_type in {"ENTRADA_NORMAL", "ENTRADA_POR_SALIDA"}:
-            if open_visit is None:
-                self.conn.execute(
-                    """
-                    INSERT INTO hotel_visits (
-                        visit_id, plate, entry_event_id, entry_at, entry_camera, room_number,
-                        status, review_required
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                    """,
-                    (
-                        str(uuid.uuid4()),
-                        event.plate,
-                        event.event_id,
-                        event.occurred_at.isoformat() if isinstance(event.occurred_at, datetime) else str(event.occurred_at),
-                        event.camera_id,
-                        event.room_number,
-                        "ABIERTA" if not event.review_required else "REVISAR",
-                        1 if event.review_required else 0,
-                    ),
-                )
-            return
-        if event.event_type in {"SALIDA_NORMAL", "SALIDA_POR_ENTRADA"} and open_visit is not None:
-            self.conn.execute(
-                """
-                UPDATE hotel_visits
-                SET exit_event_id=?, exit_at=?, exit_camera=?, exit_type=?, status=?, review_required=?
-                WHERE visit_id=?
-                """,
-                (
-                    event.event_id,
-                    event.occurred_at.isoformat() if isinstance(event.occurred_at, datetime) else str(event.occurred_at),
-                    event.camera_id,
-                    event.event_type,
-                    "CERRADA" if not event.review_required else "REVISAR",
-                    1 if event.review_required else int(open_visit["review_required"]),
-                    open_visit["visit_id"],
-                ),
-            )
+                visits.ingest(self.conn, event.event_id, event.capture_session, event.physical_track_id,
+                              historical=event.source == "legacy_eventos")
 
     def get_open_visit(self, plate: str):
-        return self.conn.execute(
-            "SELECT * FROM hotel_visits WHERE plate=? AND status='ABIERTA' ORDER BY entry_at DESC LIMIT 1",
-            (plate,),
-        ).fetchone()
+        return self.conn.execute("""SELECT * FROM current_visits WHERE kind='entry' AND plate=? AND
+                    exit_event_id IS NULL AND exceptional_reason IS NULL LIMIT 1""", (plate,)).fetchone()
 
     def count_open_visits(self) -> int:
-        row = self.conn.execute("SELECT COUNT(*) AS total FROM hotel_visits WHERE status='ABIERTA'").fetchone()
-        return int(row["total"])
+        # Legacy status counts identified entries still awaiting a credible departure
+        # signal. A possible signal never changes the canonical lifecycle.
+        return self.conn.execute("""SELECT count(*) FROM current_visits v JOIN hotel_vehicle_events e ON e.event_id=v.id
+            WHERE v.kind='entry' AND v.exit_event_id IS NULL AND v.exceptional_reason IS NULL
+            AND v.plate_status='LEIDA' AND v.pending=0 AND NOT EXISTS (
+                SELECT 1 FROM visit_cases x JOIN hotel_vehicle_events d ON d.event_id=x.id
+                WHERE e.ocr_diagnostics_json IS NULL AND x.kind='exit' AND d.camera_id<>e.camera_id
+                AND x.instant BETWEEN v.instant AND v.instant+? AND d.plate=e.plate AND d.plate_status='LEIDA'
+                AND d.review_required=0 AND (d.source<>'geometry_gate' OR d.evidence_path IS NOT NULL))""",
+            (visits.window(),)).fetchone()[0]
 
     def list_events(self) -> list[sqlite3.Row]:
         return list(self.conn.execute("SELECT * FROM hotel_vehicle_events ORDER BY occurred_at DESC"))
 
     def list_visits(self) -> list[sqlite3.Row]:
-        return list(self.conn.execute("SELECT * FROM hotel_visits ORDER BY COALESCE(entry_at, exit_at) DESC"))
+        return [v for v in visits.export_rows(self.conn) if v["entry_at"] and v["plate"] and
+                v["plate_status"] == "LEIDA" and (v["exit_at"] or not v["review_required"])]
 
     def get_event(self, event_id: str) -> sqlite3.Row | None:
         return self.conn.execute(
@@ -329,9 +298,8 @@ class HotelStore:
         )
         total = cursor.fetchone()[0]
         
-        cursor.execute("SELECT COUNT(*) FROM hotel_visits WHERE status = 'ABIERTA'")
-        open_visits = cursor.fetchone()[0]
-        
+        open_visits = self.count_open_visits()
+
         cursor.execute("SELECT COUNT(*) FROM hotel_vehicle_events WHERE review_required = 1")
         pending_review = cursor.fetchone()[0]
         
@@ -419,26 +387,12 @@ class HotelStore:
         }
 
     def get_visits_filtered(self, page: int = 1, page_size: int = 25) -> dict:
-        cursor = self.conn.cursor()
-        cursor.execute("SELECT COUNT(*) FROM hotel_visits")
-        total = cursor.fetchone()[0]
-        
-        offset = (page - 1) * page_size
-        cursor.execute("SELECT * FROM hotel_visits ORDER BY COALESCE(entry_at, exit_at) DESC LIMIT ? OFFSET ?", (page_size, offset))
-        rows = cursor.fetchall()
-        visits = [dict(row) for row in rows]
-        pages = math.ceil(total / page_size) if page_size > 0 else 1
-        
-        return {
-            "visits": visits,
-            "total": total,
-            "page": page,
-            "page_size": page_size,
-            "pages": pages
-        }
+        rows = visits.export_rows(self.conn)
+        return dict(visits=rows[(page-1)*page_size:page*page_size],total=len(rows),page=page,
+                    page_size=page_size,pages=math.ceil(len(rows)/page_size))
 
-    def get_visit(self, visit_id: str) -> sqlite3.Row | None:
-        return self.conn.execute("SELECT * FROM hotel_visits WHERE visit_id=?", (visit_id,)).fetchone()
+    def get_visit(self, visit_id):
+        return self.conn.execute("SELECT * FROM current_visits WHERE id=?", (visit_id,)).fetchone()
 
     def update_event_manually(self, event_id: str, updates: dict, changed_by: str) -> bool:
         """
@@ -528,91 +482,11 @@ class HotelStore:
             self.conn.rollback()
             raise e
 
-    def _rebuild_hotel_visits_in_transaction(self, cursor: sqlite3.Cursor) -> None:
-        cursor.execute("DELETE FROM hotel_visits")
-        cursor.execute("SELECT * FROM hotel_vehicle_events ORDER BY occurred_at ASC")
-        rows = cursor.fetchall()
-        
-        for row in rows:
-            event = HotelVehicleEvent(
-                event_id=row["event_id"],
-                occurred_at=datetime.fromisoformat(row["occurred_at"]),
-                camera_id=row["camera_id"],
-                camera_name=row["camera_name"],
-                track_id=row["track_id"],
-                movement=row["movement"],
-                movement_confidence=row["movement_confidence"],
-                event_type=row["event_type"],
-                plate=row["plate"],
-                plate_confidence=row["plate_confidence"],
-                plate_status=row["plate_status"],
-                room_number=row["room_number"],
-                room_confidence=row["room_confidence"],
-                room_status=row["room_status"],
-                vehicle_class=row["vehicle_class"],
-                vehicle_confidence=row["vehicle_confidence"],
-                evidence_path=row["evidence_path"],
-                review_required=bool(row["review_required"]),
-                source=row["source"],
-                ocr_diagnostics_json=row["ocr_diagnostics_json"],
-                notes=row["notes"]
-            )
-            if not _eligible_for_visit(event):
-                continue
-                
-            cursor.execute(
-                "SELECT * FROM hotel_visits WHERE plate=? AND status='ABIERTA' ORDER BY entry_at DESC LIMIT 1",
-                (event.plate,)
-            )
-            open_visit = cursor.fetchone()
-            
-            if event.event_type in {"ENTRADA_NORMAL", "ENTRADA_POR_SALIDA"}:
-                if open_visit is None:
-                    cursor.execute(
-                        """
-                        INSERT INTO hotel_visits (
-                            visit_id, plate, entry_event_id, entry_at, entry_camera, room_number,
-                            status, review_required
-                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                        """,
-                        (
-                            str(uuid.uuid4()),
-                            event.plate,
-                            event.event_id,
-                            event.occurred_at.isoformat(),
-                            event.camera_id,
-                            event.room_number,
-                            "ABIERTA" if not event.review_required else "REVISAR",
-                            1 if event.review_required else 0,
-                        ),
-                    )
-            elif event.event_type in {"SALIDA_NORMAL", "SALIDA_POR_ENTRADA"} and open_visit is not None:
-                cursor.execute(
-                    """
-                    UPDATE hotel_visits
-                    SET exit_event_id=?, exit_at=?, exit_camera=?, exit_type=?, status=?, review_required=?
-                    WHERE visit_id=?
-                    """,
-                    (
-                        event.event_id,
-                        event.occurred_at.isoformat(),
-                        event.camera_id,
-                        event.event_type,
-                        "CERRADA" if not event.review_required else "REVISAR",
-                        1 if event.review_required else int(open_visit["review_required"]),
-                        open_visit["visit_id"],
-                    ),
-                )
-
-
-def _eligible_for_visit(event: HotelVehicleEvent) -> bool:
-    if event.ocr_diagnostics_json and event.plate_status != "LEIDA":
-        return False
-    if event.source == "geometry_gate" and (
-        event.review_required or event.plate_status != "LEIDA" or not event.evidence_path
-    ):
-        return False
-    return bool(event.plate) and event.plate_status != "NO_LEGIBLE"
+    def _rebuild_hotel_visits_in_transaction(self, cursor):
+        # Import only missing identities; operator decisions are durable.
+        for row in cursor.execute("""SELECT event_id FROM hotel_vehicle_events e WHERE NOT EXISTS
+                  (SELECT 1 FROM visit_cases v WHERE v.id=e.event_id)""").fetchall():
+            visits.ingest(self.conn, row["event_id"], historical=True)
 
 
 def classify_event(camera_id: str, movement: str, plate: str | None, store: HotelStore | None) -> tuple[str, bool, str]:
